@@ -36,6 +36,7 @@ import { loadConfig } from "./config";
 import { GracefulShutdown } from "./graceful-shutdown";
 import { logger } from "./logger";
 import { initRateLimiter } from "./middleware/rateLimit";
+import { assertSchemaVersion } from "./schema-version";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -93,105 +94,6 @@ const notificationService = new NotificationService({
   pool: pgPool,
 });
 const scoreRefreshService = new ScoreRefreshService(pgPool, SCORE_REFRESH_INTERVAL_MINUTES);
-
-/**
- * Idempotently ensure the staging table and cursor exist. Mirrors
- * migrations/006_raw_events.sql for dev/test environments that boot without a
- * separate migration step.
- */
-async function ensureSchema(): Promise<void> {
-  await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS raw_events (
-      id              BIGSERIAL   NOT NULL,
-      ledger_sequence BIGINT      NOT NULL,
-      event_index     INT         NOT NULL,
-      contract_id     TEXT        NOT NULL,
-      topic           TEXT[]      NOT NULL,
-      data            JSONB       NOT NULL,
-      processed_at    TIMESTAMPTZ,
-      PRIMARY KEY (ledger_sequence, event_index)
-    )
-  `);
-  await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS indexer_cursor (
-      id               TEXT        PRIMARY KEY,
-      processed_cursor BIGINT      NOT NULL DEFAULT 0,
-      updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS indexer_state (
-      ledger_sequence BIGINT      PRIMARY KEY,
-      state_root      TEXT        NOT NULL,
-      computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS device_tokens (
-      id         SERIAL      PRIMARY KEY,
-      address    TEXT        NOT NULL,
-      token      TEXT        NOT NULL,
-      platform   TEXT        NOT NULL CHECK (platform IN ('ios', 'android', 'web')),
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (address, token)
-    )
-  `);
-  await pgPool.query(`
-    CREATE INDEX IF NOT EXISTS idx_device_tokens_address_updated
-      ON device_tokens (address, updated_at DESC)
-  `);
-  await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS sent_notifications (
-      id              BIGSERIAL    PRIMARY KEY,
-      event_id        BIGINT       NOT NULL,
-      event_type      TEXT         NOT NULL,
-      recipient       TEXT         NOT NULL,
-      dispatch_key    TEXT         NOT NULL,
-      dispatched_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-      UNIQUE (dispatch_key)
-    )
-  `);
-  await pgPool.query(`
-    CREATE INDEX IF NOT EXISTS idx_sent_notifications_recipient
-      ON sent_notifications (recipient, dispatched_at DESC)
-  `);
-
-  await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS blocks (
-      blocker TEXT NOT NULL,
-      blocked TEXT NOT NULL,
-      PRIMARY KEY (blocker, blocked)
-    )
-  `);
-  await pgPool.query(`
-    CREATE INDEX IF NOT EXISTS idx_blocks_blocker ON blocks (blocker)
-  `);
-  await pgPool.query(`
-    CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks (blocked)
-  `);
-  await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS dm_keys (
-      address       TEXT PRIMARY KEY,
-      x25519_pubkey TEXT NOT NULL,
-      updated_at    TIMESTAMP NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS notification_preferences (
-      address              TEXT PRIMARY KEY,
-      browser_push_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-      new_followers        BOOLEAN NOT NULL DEFAULT TRUE,
-      new_likes            BOOLEAN NOT NULL DEFAULT TRUE,
-      new_comments         BOOLEAN NOT NULL DEFAULT TRUE,
-      direct_messages      BOOLEAN NOT NULL DEFAULT TRUE,
-      pool_activity        BOOLEAN NOT NULL DEFAULT TRUE,
-      governance_updates   BOOLEAN NOT NULL DEFAULT TRUE,
-      updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-}
 
 // ── Event normalisation ─────────────────────────────────────────────────────
 
@@ -256,7 +158,7 @@ async function main(): Promise<void> {
   // Initialise HTTP rate limiter (upgrades to Redis store when REDIS_URL is set).
   await initRateLimiter();
 
-  await ensureSchema();
+  await assertSchemaVersion(pgPool);
 
   const pipeline = new IngestPipeline(pgPool, {
     streamId: CONTRACT_ID,

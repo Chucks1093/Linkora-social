@@ -8,7 +8,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-linkora}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
     healthcheck:
@@ -16,6 +15,33 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # One-shot container: applies all numbered migrations in filename order and
+  # exits.  The indexer will not start until this service completes successfully,
+  # ensuring the DB is never behind when the application boots.
+  migrate:
+    image: postgres:16-alpine
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-linkora}
+    command: >
+      sh -c "
+        for f in \$(ls /migrations/*.sql | sort); do
+          echo \"[migrate] applying \$$f\";
+          psql -h postgres
+               -U ${POSTGRES_USER:-linkora}
+               -d ${POSTGRES_DB:-linkora}
+               -v ON_ERROR_STOP=1
+               -f \$$f
+          || exit 1;
+        done;
+        echo '[migrate] all migrations applied'
+      "
 
   indexer:
     build: .
@@ -29,6 +55,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   postgres_data:
