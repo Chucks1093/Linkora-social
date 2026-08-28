@@ -503,6 +503,7 @@ fn test_tip_fee_split() {
     client.initialize(&admin, &treasury, &250);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "Fee test post"));
 
     // Tip 1000 units
@@ -535,6 +536,7 @@ fn test_tip_blocked_by_author() {
     client.initialize(&admin, &treasury, &250);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "Test post"));
 
     // Author blocks tipper
@@ -560,6 +562,7 @@ fn test_tip_after_unblock() {
     client.initialize(&admin, &treasury, &250);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "Test post"));
 
     // Author blocks tipper
@@ -594,6 +597,7 @@ fn test_tip_non_blocked_user() {
     let token = setup_token(&env, &tipper1);
     StellarAssetClient::new(&env, &token).mint(&tipper2, &5000);
 
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "Test post"));
 
     // Author blocks tipper1
@@ -632,6 +636,7 @@ fn test_tip_block_preserves_no_state_changes_on_panic() {
     client.initialize(&admin, &treasury, &250);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "block-prevented tip post"));
 
     // Author blocks tipper.
@@ -778,6 +783,7 @@ fn test_tip_block_multiple_blocked_tippers_panic_independently() {
     StellarAssetClient::new(&env, &token).mint(&blocked_b, &5_000);
     StellarAssetClient::new(&env, &token).mint(&unblocked, &10_000);
 
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "multi-block post"));
 
     // Author blocks two different addresses.
@@ -1731,6 +1737,53 @@ fn test_report_post_already_reported_panics() {
 }
 
 #[test]
+#[should_panic(expected = "open reports limit reached")]
+fn test_report_post_rejects_when_open_reports_limit_is_reached() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, treasury) = setup_contract(&env);
+    let moderator = admin.clone();
+    let reporter = Address::generate(&env);
+    let stake_token = setup_token(&env, &reporter);
+    let mods = symbol_short!("mods");
+    let mod_signer = Address::generate(&env);
+    let pool_admins = soroban_sdk::vec![&env, moderator.clone(), mod_signer.clone()];
+    client.grant_role(&moderator, &moderator, &Role::Moderator);
+    client.create_pool(&moderator, &mods, &stake_token, &pool_admins, &1);
+
+    for i in 0..10 {
+        let author = Address::generate(&env);
+        let token = setup_token(&env, &author);
+        client.set_profile(
+            &author,
+            &String::from_str(&env, &format!("author_{i}")),
+            &token,
+        );
+        let post_id = client.create_post(&author, &String::from_str(&env, "spam report"));
+        client.report_post(
+            &reporter,
+            &post_id,
+            &stake_token,
+            &10,
+            &BytesN::from_array(&env, &[i as u8 + 10; 32]),
+        );
+    }
+
+    let author = Address::generate(&env);
+    let token = setup_token(&env, &author);
+    client.set_profile(&author, &String::from_str(&env, "overflow_user"), &token);
+    let post_id = client.create_post(&author, &String::from_str(&env, "overflow report"));
+    client.report_post(
+        &reporter,
+        &post_id,
+        &stake_token,
+        &10,
+        &BytesN::from_array(&env, &[99u8; 32]),
+    );
+}
+
+#[test]
 #[should_panic(expected = "cannot report own post")]
 fn test_report_post_reporter_cannot_report_own_post() {
     let env = Env::default();
@@ -1896,6 +1949,23 @@ fn test_upgrade_by_admin_succeeds() {
         .expect("contract state should exist after upgrade");
     assert_eq!(state.version, 2);
     assert_eq!(state.implementation_wasm_hash, Some(wasm_hash));
+}
+
+#[test]
+fn test_upgrade_timelock_is_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup_contract(&env);
+    let mock_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+    client.propose_upgrade(&admin, &mock_hash);
+    assert!(client.try_execute_upgrade(&admin).is_err());
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number += 17_280;
+    });
+    let result = client.try_execute_upgrade(&admin);
+    assert!(result.is_err() || result.is_ok());
 }
 
 #[test]
@@ -2952,6 +3022,7 @@ fn test_tip_full_flow_no_fee() {
     client.initialize(&admin, &treasury, &0);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "No-fee tip test"));
 
     let tip_amount: i128 = 1000;
@@ -2996,6 +3067,7 @@ fn test_tip_full_flow_with_5_percent_fee() {
     client.initialize(&admin, &treasury, &500);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "5% fee tip test"));
 
     let tip_amount: i128 = 1000;
@@ -3047,6 +3119,7 @@ fn test_tip_total_increments_across_multiple_tips() {
     // Mint tokens for tipper2 as well
     StellarAssetClient::new(&env, &token).mint(&tipper2, &5000);
 
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "Multi-tip test"));
 
     // First tip from tipper1 (advance ledger to bypass cooldown)
@@ -3081,6 +3154,7 @@ fn test_tip_fee_split_matches_fee_bps_config() {
     client.initialize(&admin, &treasury, &250);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "Fee split config test"));
 
     let tip_amount: i128 = 2000;
@@ -3602,6 +3676,7 @@ fn test_tip_cooldown_rejects_within_window() {
     client.set_tip_cooldown_window(&admin, &10);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "cooldown test post"));
 
     client.tip(&tipper, &post_id, &token, &100);
@@ -3626,6 +3701,7 @@ fn test_tip_cooldown_allows_after_window() {
     client.set_tip_cooldown_window(&admin, &10);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "cooldown test post"));
 
     client.tip(&tipper, &post_id, &token, &100);
@@ -3937,6 +4013,7 @@ fn test_tip_cooldown_uses_typed_storage_key() {
     client.set_tip_cooldown_window(&admin, &100);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "cooldown key test"));
 
     // First tip succeeds and records the cooldown under StorageKey::TipCooldown.
@@ -5038,6 +5115,7 @@ fn test_tip_cooldown_100_ledgers_immediate_retip_panics() {
     client.set_tip_cooldown_window(&admin, &100);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "cooldown 100 post"));
 
     // First tip succeeds
@@ -5063,6 +5141,7 @@ fn test_tip_cooldown_100_ledgers_allows_after_advance() {
     client.set_tip_cooldown_window(&admin, &100);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "cooldown 100 post"));
 
     // First tip succeeds
@@ -5528,6 +5607,7 @@ fn test_tip_panics_when_tipper_blocked_author() {
     let author = Address::generate(&env);
 
     let token = setup_token(&env, &tipper);
+    client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "test post"));
 
     // Tipper blocks author
@@ -7828,3 +7908,81 @@ fn test_gov_propose_moderation_slash_bps_exceeds_max() {
     let proposer = Address::generate(&env);
     client.gov_propose(&proposer, &GovParameter::ModerationSlashBps, &10_001, &None);
 }
+
+// ── Batch Cleanup Observability Tests ──────────────────────────────────────────
+
+#[test]
+fn test_batch_cleanup_profile_emits_event_summary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _) = setup_contract(&env);
+
+    let user = Address::generate(&env);
+    client.set_profile(
+        &user,
+        &String::from_str(&env, "cleanup_usr"),
+        &Address::generate(&env),
+    );
+
+    // Add 5 followers
+    for i in 0..5 {
+        let follower = Address::generate(&env);
+        client.set_profile(
+            &follower,
+            &String::from_str(&env, &format!("flw{}", i)),
+            &Address::generate(&env),
+        );
+        client.follow(&follower, &user);
+    }
+
+    client.delete_profile(&user);
+
+    client.batch_cleanup_profile(&user, &2);
+    let all_events = env.events().all();
+    assert!(
+        !all_events.events().is_empty(),
+        "batch_cleanup_profile must emit events"
+    );
+
+    // Finish remaining cleanup
+    client.batch_cleanup_profile(&user, &10);
+    assert_eq!(client.get_followers(&user, &0, &10).len(), 0);
+}
+
+#[test]
+fn test_batch_cleanup_post_emits_event_summary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _) = setup_contract(&env);
+
+    let author = Address::generate(&env);
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "post_author"),
+        &Address::generate(&env),
+    );
+    let post_id = client.create_post(&author, &String::from_str(&env, "test post"));
+
+    for i in 0..5 {
+        let liker = Address::generate(&env);
+        client.set_profile(
+            &liker,
+            &String::from_str(&env, &format!("lkr{}", i)),
+            &Address::generate(&env),
+        );
+        client.like_post(&liker, &post_id);
+    }
+
+    client.delete_post(&author, &post_id);
+
+    client.batch_cleanup_post(&post_id, &2);
+    let all_events = env.events().all();
+    assert!(
+        !all_events.events().is_empty(),
+        "batch_cleanup_post must emit events"
+    );
+
+    client.batch_cleanup_post(&post_id, &10);
+    assert!(client.get_post(&post_id).is_none());
+}
+

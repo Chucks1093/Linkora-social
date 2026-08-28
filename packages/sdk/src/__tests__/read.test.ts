@@ -19,6 +19,12 @@ jest.mock("@stellar/stellar-sdk/rpc", () => ({
 
 jest.mock("@stellar/stellar-base", () => ({
   Contract: jest.fn(() => ({ call: mockCall })),
+  StrKey: {
+    isValidEd25519PublicKey: jest.fn(
+      (value: string) => typeof value === "string" && value.startsWith("G")
+    ),
+    isValidContract: jest.fn((value: string) => typeof value === "string" && value.startsWith("C")),
+  },
   nativeToScVal: jest.fn((val: unknown, opts?: unknown) => ({
     _type: "scval",
     _val: val,
@@ -264,6 +270,23 @@ describe("LinkoraClient read methods", () => {
       notFound();
       expect(await client.getTreasury()).toBeNull();
     });
+    it("rethrows non-NotFound errors", async () => {
+      simError("fetch failed");
+      await expect(client.getTreasury()).rejects.toThrow("fetch failed");
+    });
+  });
+
+  describe("getDmKey", () => {
+    it("returns the DM key", async () => {
+      success(new Uint8Array([1, 2, 3]));
+      const key = await client.getDmKey("GUSER");
+      expect(key).toEqual(new Uint8Array([1, 2, 3]));
+    });
+
+    it("rethrows non-NotFound errors", async () => {
+      simError("network timeout");
+      await expect(client.getDmKey("GUSER")).rejects.toThrow("network timeout");
+    });
   });
 
   describe("getTipCooldownWindow", () => {
@@ -283,52 +306,31 @@ describe("LinkoraClient read methods", () => {
       await expect(client.getPostCount()).rejects.toThrow("Unauthorized");
     });
   });
-});
 
-describe("contract address validation", () => {
-  let client: LinkoraClient;
+  describe("contract address validation", () => {
+    it("accepts valid contract addresses (C...)", () => {
+      const contractId = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+      expect(() => client.setProfile("GUSER", "alice", contractId)).not.toThrow();
+    });
 
-  beforeEach(() => {
-    client = new LinkoraClient({ contractId: "CDUMMY", rpcUrl: "https://dummy.example.com" });
-  });
+    it("accepts valid account addresses (G...)", () => {
+      const accountKey = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+      expect(() => client.setProfile("GUSER", "alice", accountKey)).not.toThrow();
+    });
 
-  it("accepts valid contract addresses (C...)", () => {
-    const contractId = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-    expect(() =>
-      client.setProfile(
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-        "alice",
-        contractId
-      )
-    ).not.toThrow();
-  });
+    it("rejects invalid addresses", () => {
+      expect(() => client.setProfile("GUSER", "alice", "invalid")).toThrow("must be a valid");
+    });
 
-  it("accepts valid account addresses (G...)", () => {
-    const accountKey = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-    expect(() => client.setProfile(accountKey, "alice", accountKey)).not.toThrow();
-  });
+    it("accepts contract IDs in tip method", () => {
+      const contractId = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+      expect(() => client.tip("GUSER", 1n, contractId, 100n)).not.toThrow();
+    });
 
-  it("rejects invalid addresses", () => {
-    expect(() => client.setProfile("GUSER", "alice", "invalid")).toThrow("must be a valid");
-  });
-
-  it("accepts contract IDs in tip method", () => {
-    const contractId = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-    expect(() =>
-      client.tip("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", 1n, contractId, 100n)
-    ).not.toThrow();
-  });
-
-  it("accepts contract IDs in poolDeposit method", () => {
-    const contractId = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-    expect(() =>
-      client.poolDeposit(
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-        "pool1",
-        contractId,
-        100n
-      )
-    ).not.toThrow();
+    it("accepts contract IDs in poolDeposit method", () => {
+      const contractId = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+      expect(() => client.poolDeposit("GUSER", "pool1", contractId, 100n)).not.toThrow();
+    });
   });
 });
 
