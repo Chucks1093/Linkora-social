@@ -8,7 +8,7 @@ import { LinkPreview } from "./LinkPreview";
 import { MediaItem } from "@/hooks/useMediaUpload";
 import { LinkMetadata } from "@/hooks/useLinkPreview";
 import { Link as LinkIcon } from "lucide-react";
-import { utf8Bytes } from "../../../../../packages/sdk/src/lib/utf8";
+import { utf8Bytes } from "linkora-sdk";
 
 export interface PostComposerProps {
   content: string;
@@ -99,7 +99,7 @@ export function PostComposer({
         {/* Link Preview Card */}
         <LinkPreview
           metadata={linkPreview}
-          onRemoveLinkPreview={onRemoveLinkPreview}
+          onRemove={onRemoveLinkPreview}
           isLoading={isLinkLoading}
         />
       </div>

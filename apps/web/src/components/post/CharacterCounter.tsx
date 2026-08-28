@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { utf8Bytes } from "../../../../../packages/sdk/src/lib/utf8";
+import { utf8Bytes } from "linkora-sdk";
 
 export interface CharacterCounterProps {
   value: string;

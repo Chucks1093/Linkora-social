@@ -40,10 +40,6 @@ jest.mock("@stellar/stellar-base", () => ({
   TransactionBuilder: jest.fn(() => ({ addOperation: mockAddOperation })),
   Account: jest.fn(),
   Keypair: { random: jest.fn(() => ({ publicKey: () => "GDUMMYKEYPAIRXXXXXXXXXXXXXXXXXXXXXX" })) },
-  StrKey: {
-    isValidEd25519PublicKey: (value: string) => value.startsWith("G") && value.length === 56,
-    isValidContract: (value: string) => value.startsWith("C") && value.length === 56,
-  },
   xdr: {},
 }));
 
