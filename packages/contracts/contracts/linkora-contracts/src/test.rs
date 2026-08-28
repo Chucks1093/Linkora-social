@@ -5826,7 +5826,7 @@ fn test_update_credential_root_missing_authority_panics() {
 }
 
 #[test]
-#[should_panic(expected = "signature must not be an all-zero signature")]
+#[should_panic(expected = "signature must not be an all-zero or malformed signature")]
 fn test_update_credential_root_zero_signature_rejected() {
     let env = Env::default();
     env.mock_all_auths();
@@ -5841,6 +5841,24 @@ fn test_update_credential_root_zero_signature_rejected() {
     let zero_signature = BytesN::from_array(&env, &[0u8; 64]);
 
     client.update_credential_root(&user, &new_root, &zero_signature);
+}
+
+#[test]
+#[should_panic(expected = "new_root must not be an all-zero or malformed public key")]
+fn test_update_credential_root_zero_root_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup_contract(&env);
+
+    let signing_key = credential_authority_signing_key(1);
+    let pubkey = credential_authority_pubkey(&env, &signing_key);
+    client.set_credential_authority(&admin, &pubkey);
+
+    let user = Address::generate(&env);
+    let zero_root = BytesN::from_array(&env, &[0u8; 32]);
+    let dummy_signature = BytesN::from_array(&env, &[1u8; 64]);
+
+    client.update_credential_root(&user, &zero_root, &dummy_signature);
 }
 
 #[test]

@@ -12,7 +12,7 @@ mod validation;
 pub use errors::{ContractError, RentError};
 use validation::{
     validate_address_list, validate_amount, validate_gov_parameter, validate_non_default_address,
-    validate_protocol_fee, validate_report_verdict, validate_signature, validate_u32_range,
+    validate_protocol_fee, validate_pubkey_32, validate_report_verdict, validate_signature, validate_u32_range,
     validate_username, MAX_BIO_LEN, MAX_CONTENT_LEN, MAX_FEE_BPS, MAX_QUORUM,
 };
 
@@ -1122,6 +1122,7 @@ impl LinkoraContract {
         Self::bump_instance(&env);
         admin.require_auth();
         validate_non_default_address(&env, "admin", &admin);
+        validate_pubkey_32(&env, "authority_pubkey", &pubkey);
         Self::require_role(&env, &admin, Role::Admin);
         let key = StorageKey::CredentialAuthority;
         env.storage().persistent().set(&key, &pubkey);
@@ -1148,6 +1149,7 @@ impl LinkoraContract {
         Self::bump_instance(&env);
         user.require_auth();
         validate_non_default_address(&env, "user", &user);
+        validate_pubkey_32(&env, "new_root", &new_root);
         validate_signature(&env, "signature", &signature);
 
         let authority_key = StorageKey::CredentialAuthority;
@@ -1156,6 +1158,7 @@ impl LinkoraContract {
             .persistent()
             .get(&authority_key)
             .expect("credential authority not set");
+        validate_pubkey_32(&env, "authority_pubkey", &authority_pubkey);
         Self::bump(&env, &authority_key);
 
         // Verify Ed25519 signature: ed25519_verify(pubkey, message, signature).
