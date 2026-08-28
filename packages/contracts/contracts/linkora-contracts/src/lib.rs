@@ -55,6 +55,7 @@ pub enum StorageKey {
     AttestationNullifier(BytesN<32>), // persistent: sha256(report_cbor) -> bool (replay guard)
     Report(u64, Address), // persistent: (post_id, reporter) -> Report
     ReportCount(u64),  // persistent: post_id -> u32 count of reports
+    OpenReports(Address), // persistent: reporter -> u32 count of unresolved reports
 
     // ── Lazy Cleanup (Tombstones & Indexes) ───────────────────────────────
     DeletedPost(u64),              // persistent: post_id -> bool
@@ -107,6 +108,7 @@ const POOL_DEPOSIT_COOLDOWN_LEDGERS: u32 = 720;
 // ── Pagination Limit ──────────────────────────────────────────────────────────
 
 const MAX_PAGE_LIMIT: u32 = 50;
+const MAX_OPEN_REPORTS_PER_REPORTER: u32 = 10;
 
 // ── Data Types ────────────────────────────────────────────────────────────────
 
@@ -556,20 +558,24 @@ pub struct ReportDismissedEvent {
 
 // ── Issue #946: missing events for batch ops and admin functions ──────────────
 
+/// Emitted during `batch_cleanup_profile` to report progress and remaining entry count to indexers.
 #[contractevent]
 #[derive(Clone)]
 pub struct BatchCleanupProfileEvent {
     #[topic]
     pub user: Address,
     pub cleaned_entries: u32,
+    pub remaining_entries: u32,
 }
 
+/// Emitted during `batch_cleanup_post` to report progress and remaining entry count to indexers.
 #[contractevent]
 #[derive(Clone)]
 pub struct BatchCleanupPostEvent {
     #[topic]
     pub post_id: u64,
     pub cleaned_entries: u32,
+    pub remaining_entries: u32,
 }
 
 #[contractevent]
@@ -1085,6 +1091,8 @@ impl LinkoraContract {
             Self::bump(&env, &author_key);
         }
 
+        let remaining_entries: u32 = f_count + following_count + author_posts.len() as u32;
+
         if f_count == 0 && following_count == 0 && author_posts.is_empty() {
             env.storage().persistent().remove(&tombstone_key);
         }
@@ -1092,6 +1100,7 @@ impl LinkoraContract {
         BatchCleanupProfileEvent {
             user,
             cleaned_entries: entries_removed,
+            remaining_entries,
         }
         .publish(&env);
     }
@@ -2041,6 +2050,8 @@ impl LinkoraContract {
             Self::bump(&env, &tc_count_key);
         }
 
+        let remaining_entries: u32 = likes_count + reports_count + tc_count;
+
         // Finalize Tombstone Removal
         if likes_count == 0 && reports_count == 0 && tc_count == 0 {
             env.storage().persistent().remove(&tombstone_key);
@@ -2049,6 +2060,7 @@ impl LinkoraContract {
         BatchCleanupPostEvent {
             post_id,
             cleaned_entries: entries_removed,
+            remaining_entries,
         }
         .publish(&env);
     }
@@ -2423,7 +2435,7 @@ impl LinkoraContract {
         let balance_before = token_client.balance(&env.current_contract_address());
 
         // Transfer tokens
-        token_client.transfer(&depositor, &env.current_contract_address(), &amount);
+        token_client.transfer(&depositor, env.current_contract_address(), &amount);
 
         // Verify balance increased by exactly the amount claimed
         let balance_after = token_client.balance(&env.current_contract_address());
@@ -3590,6 +3602,18 @@ impl LinkoraContract {
             panic!("already reported");
         }
 
+        let reporter_reports_key = StorageKey::OpenReports(reporter.clone());
+        let open_reports: u32 = env
+            .storage()
+            .persistent()
+            .get(&reporter_reports_key)
+            .unwrap_or(0u32);
+        require_with_error!(
+            &env,
+            open_reports < MAX_OPEN_REPORTS_PER_REPORTER,
+            "open reports limit reached"
+        );
+
         assert!(stake_amount > 0, "stake amount must be positive");
         token::Client::new(&env, &token).transfer(
             &reporter,
@@ -3618,6 +3642,16 @@ impl LinkoraContract {
         };
         env.storage().persistent().set(&report_key, &report);
         Self::bump(&env, &report_key);
+
+        let next_open_reports = open_reports + 1;
+        if next_open_reports == 0 {
+            env.storage().persistent().remove(&reporter_reports_key);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&reporter_reports_key, &next_open_reports);
+            Self::bump(&env, &reporter_reports_key);
+        }
 
         PostReportedEvent {
             post_id,
@@ -3969,6 +4003,22 @@ impl LinkoraContract {
         report.status = verdict;
         env.storage().persistent().set(&report_key, &report);
         Self::bump(&env, &report_key);
+
+        let reporter_reports_key = StorageKey::OpenReports(report.reporter.clone());
+        let current_open_reports: u32 = env
+            .storage()
+            .persistent()
+            .get(&reporter_reports_key)
+            .unwrap_or(0u32);
+        let next_open_reports = current_open_reports.saturating_sub(1);
+        if next_open_reports == 0 {
+            env.storage().persistent().remove(&reporter_reports_key);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&reporter_reports_key, &next_open_reports);
+            Self::bump(&env, &reporter_reports_key);
+        }
     }
 
     /// Retrieves a report by post ID and reporter.

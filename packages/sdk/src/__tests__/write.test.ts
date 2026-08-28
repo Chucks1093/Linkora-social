@@ -1,5 +1,5 @@
 import { LinkoraClient } from "../client";
-import { InvalidInputError } from "../errors";
+import { InvalidInputError, ValidationError } from "../errors";
 
 const mockCall = jest.fn();
 const mockBuild = jest.fn();
@@ -236,4 +236,70 @@ describe("LinkoraClient write methods", () => {
       InvalidInputError
     );
   });
+
+  it("rejects oversized byte arrays for verifyAnalyticsAttestation", () => {
+    const oversizedReportCbor = new Uint8Array(64 * 1024 + 1);
+    const validSignature = new Uint8Array(64).fill(0xab);
+
+    expect(() =>
+      client.verifyAnalyticsAttestation(
+        "default",
+        oversizedReportCbor,
+        validSignature,
+        "GCREATOR",
+        1000,
+        2000
+      )
+    ).toThrow(ValidationError);
+  });
 });
+
+describe("prepare*Tx methods (Submittable)", () => {
+  let client: LinkoraClient;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    client = new LinkoraClient({ contractId: "CDUMMY", rpcUrl: "https://dummy.example.com" });
+    mockAddOperation.mockReturnValue({ setTimeout: mockSetTimeout });
+    mockSetTimeout.mockReturnValue({ build: mockBuild });
+    mockBuild.mockReturnValue({ toEnvelope: mockToEnvelope });
+    mockToEnvelope.mockReturnValue({ toXDR: mockToXDR });
+    mockToXDR.mockReturnValue(XDR);
+  });
+
+  const addr = (s: string) => expect.objectContaining({ _val: s });
+  const val = (v: unknown) => expect.objectContaining({ _val: v });
+
+  it("prepareCreatePostTx fetches sequence and uses prepareTransaction", async () => {
+    jest.spyOn(client as any, 'getAccountForTx').mockResolvedValue(new (require("@stellar/stellar-base").Account)("GAUTHOR", "100"));
+    jest.spyOn(client, 'prepareTransaction').mockResolvedValue({
+      toEnvelope: () => ({ toXDR: () => "PREPARED_XDR" })
+    } as any);
+
+    const result = await client.prepareCreatePostTx("GAUTHOR", "hello");
+    expect(result).toBe("PREPARED_XDR");
+    expect(client.prepareTransaction).toHaveBeenCalledWith(
+      "create_post",
+      expect.objectContaining({ _accountId: "GAUTHOR" }),
+      addr("GAUTHOR"),
+      val("hello")
+    );
+  });
+
+  it("prepareFollowTx fetches sequence and uses prepareTransaction", async () => {
+    jest.spyOn(client as any, 'getAccountForTx').mockResolvedValue(new (require("@stellar/stellar-base").Account)("GA", "100"));
+    jest.spyOn(client, 'prepareTransaction').mockResolvedValue({
+      toEnvelope: () => ({ toXDR: () => "PREPARED_XDR" })
+    } as any);
+
+    const result = await client.prepareFollowTx("GA", "GB");
+    expect(result).toBe("PREPARED_XDR");
+    expect(client.prepareTransaction).toHaveBeenCalledWith(
+      "follow",
+      expect.objectContaining({ _accountId: "GA" }),
+      addr("GA"),
+      addr("GB")
+    );
+  });
+});
+
