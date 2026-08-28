@@ -179,6 +179,12 @@ export interface Database {
     limit: number;
     cursor?: number;
   }): Promise<{ posts: Post[]; total: number; hasMore: boolean }>;
+  getFeed?(filters: {
+    viewer?: string;
+    limit: number;
+    offset: number;
+  }): Promise<{ posts: Post[]; total: number }>;
+
   getFollowers(
     address: string,
     limit: number,
