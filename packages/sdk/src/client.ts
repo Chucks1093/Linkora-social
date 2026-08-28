@@ -25,6 +25,8 @@ import { GovParameter } from "./generated/types.js";
 import type { GovProposal } from "./generated/types.js";
 import { ConnectionHealthMonitor, HealthCheckConfig, ConnectionStatusCallback } from "./health.js";
 import { fetchWithTimeout } from "./utils/fetch.js";
+import type { QueueSigner, RunOptions } from "./queue.js";
+import { submitTransaction } from "./submit.js";
 
 const { isSimulationError, isSimulationSuccess } = rpc.Api;
 
@@ -176,8 +178,24 @@ export class LinkoraClient extends GeneratedLinkoraClient {
   }
 
   /** Build an RPC server handle honoring the insecure-HTTP setting. */
-  private createRpcServer(): rpc.Server {
+  createRpcServer(): rpc.Server {
     return new rpc.Server(this._rpcUrl, { allowHttp: this._allowHttp });
+  }
+
+  /**
+   * Convenience method to sign and submit a transaction using the TransactionQueue.
+   *
+   * @param xdrOrTx The transaction to submit (base64 XDR string or Transaction object).
+   * @param signer The wallet signer.
+   * @param opts Optional run options.
+   * @returns The transaction hash.
+   */
+  async submitTransaction(
+    xdrOrTx: string | Transaction,
+    signer: QueueSigner,
+    opts?: RunOptions
+  ): Promise<string> {
+    return submitTransaction(this, xdrOrTx, signer, opts);
   }
 
   /**

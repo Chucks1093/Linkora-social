@@ -236,4 +236,31 @@ describe("LinkoraClient write methods", () => {
       InvalidInputError
     );
   });
+
+  it("submitTransaction integrates with TransactionQueue", async () => {
+    const mockSigner = {
+      signTransaction: jest.fn().mockResolvedValue("SIGNED_XDR"),
+    };
+
+    const mockSimulate = jest.fn().mockResolvedValue({ success: true, resourceFee: "100" });
+    const mockSend = jest.fn().mockResolvedValue({ status: "PENDING", hash: "hash123" });
+    const mockGet = jest.fn().mockResolvedValue({ status: "SUCCESS" });
+
+    const { Server } = require("@stellar/stellar-sdk/rpc");
+    Server.mockImplementation(() => ({
+      simulateTransaction: mockSimulate,
+      sendTransaction: mockSend,
+      getTransaction: mockGet,
+    }));
+
+    // Fresh client to pick up the mocked Server implementation
+    const submitClient = new LinkoraClient({ contractId: "CDUMMY", rpcUrl: "https://dummy.example.com" });
+    const hash = await submitClient.submitTransaction("XDR_STRING", mockSigner);
+
+    expect(mockSigner.signTransaction).toHaveBeenCalledWith("XDR_STRING");
+    expect(mockSimulate).toHaveBeenCalledWith("SIGNED_XDR");
+    expect(mockSend).toHaveBeenCalledWith("SIGNED_XDR");
+    expect(mockGet).toHaveBeenCalledWith("hash123");
+    expect(hash).toBe("hash123");
+  });
 });
