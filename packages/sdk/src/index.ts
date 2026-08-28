@@ -3,6 +3,7 @@ export * from "./client.js";
 export * from "./errors.js";
 export * from "./credentials.js";
 export * from "./mini-apps/validateManifest.js";
+export * from "./lib/utf8.js";
 export * from "./events/cursor.js";
 export * from "./events/subscriber.js";
 export * from "./health.js";

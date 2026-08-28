@@ -34,6 +34,10 @@ jest.mock("@stellar/stellar-base", () => ({
   TransactionBuilder: jest.fn(() => ({ addOperation: mockAddOperation })),
   Account: jest.fn(),
   Keypair: { random: jest.fn(() => ({ publicKey: () => "GDUMMYKEYPAIRXXXXXXXXXXXXXXXXXXXXXX" })) },
+  StrKey: {
+    isValidEd25519PublicKey: (value: string) => value.startsWith("G") && value.length === 56,
+    isValidContract: (value: string) => value.startsWith("C") && value.length === 56,
+  },
   xdr: {},
 }));
 
@@ -282,14 +286,26 @@ describe("LinkoraClient read methods", () => {
 });
 
 describe("contract address validation", () => {
+  let client: LinkoraClient;
+
+  beforeEach(() => {
+    client = new LinkoraClient({ contractId: "CDUMMY", rpcUrl: "https://dummy.example.com" });
+  });
+
   it("accepts valid contract addresses (C...)", () => {
     const contractId = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-    expect(() => client.setProfile("GUSER", "alice", contractId)).not.toThrow();
+    expect(() =>
+      client.setProfile(
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        "alice",
+        contractId
+      )
+    ).not.toThrow();
   });
 
   it("accepts valid account addresses (G...)", () => {
     const accountKey = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-    expect(() => client.setProfile("GUSER", "alice", accountKey)).not.toThrow();
+    expect(() => client.setProfile(accountKey, "alice", accountKey)).not.toThrow();
   });
 
   it("rejects invalid addresses", () => {
@@ -298,12 +314,21 @@ describe("contract address validation", () => {
 
   it("accepts contract IDs in tip method", () => {
     const contractId = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-    expect(() => client.tip("GUSER", 1n, contractId, 100n)).not.toThrow();
+    expect(() =>
+      client.tip("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", 1n, contractId, 100n)
+    ).not.toThrow();
   });
 
   it("accepts contract IDs in poolDeposit method", () => {
     const contractId = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-    expect(() => client.poolDeposit("GUSER", "pool1", contractId, 100n)).not.toThrow();
+    expect(() =>
+      client.poolDeposit(
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        "pool1",
+        contractId,
+        100n
+      )
+    ).not.toThrow();
   });
 });
 
