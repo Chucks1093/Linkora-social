@@ -568,7 +568,26 @@ export class LinkoraClient extends GeneratedLinkoraClient {
 
     // rpc.assembleTransaction only supports single-invoke transactions, so for
     // multi-op transactions apply each op's simulated auth entries manually.
-    const results = simulationResult.result ?? [];
+    const results = Array.isArray(simulationResult.result) ? simulationResult.result : [];
+
+    if (results.length !== ops.length) {
+      throw new SimulationError(
+        `Multi-operation simulation result mismatch: expected ${ops.length} auth entries for ${ops.length} operations, got ${results.length}`,
+        undefined,
+        simulationResult.result
+      );
+    }
+
+    for (let i = 0; i < results.length; i += 1) {
+      const result = results[i] as { auth?: unknown } | undefined;
+      if (!result || !Array.isArray(result.auth)) {
+        throw new SimulationError(
+          `Multi-operation simulation result mismatch: missing auth array for operation ${i} (expected ${ops.length} entries total)`,
+          undefined,
+          result
+        );
+      }
+    }
 
     const realBuilder = new TransactionBuilder(sourceAccount, {
       fee: String(Number(simulationResult.minResourceFee || "0") + 100),
