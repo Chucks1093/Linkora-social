@@ -113,6 +113,7 @@ const POOL_DEPOSIT_COOLDOWN_LEDGERS: u32 = 720;
 
 const MAX_PAGE_LIMIT: u32 = 50;
 const MAX_OPEN_REPORTS_PER_REPORTER: u32 = 10;
+const MAX_TIP_TOTAL: i128 = 1_000_000_000_000_000_000; // 10^18 — bound tip_total to limit storage-rent cost
 
 // ── Data Types ────────────────────────────────────────────────────────────────
 
@@ -2326,6 +2327,11 @@ impl LinkoraContract {
         let fee_amount =
             (amount / 10_000) * fee_bps as i128 + (amount % 10_000) * fee_bps as i128 / 10_000;
         let author_amount = amount - fee_amount;
+        require_with_error!(
+            &env,
+            post.tip_total.checked_add(author_amount).unwrap_or(0) <= MAX_TIP_TOTAL,
+            "tip_total cap exceeded"
+        );
         post.tip_total += author_amount;
         env.storage().persistent().set(&key, &post);
         Self::bump(&env, &key);
