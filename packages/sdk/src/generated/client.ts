@@ -85,7 +85,9 @@ export class GeneratedLinkoraClient {
     this.contractId = config.contractId;
     this.rpcUrl = config.rpcUrl;
     this.networkPassphrase = config.networkPassphrase || DEFAULT_NETWORK;
-    this.allowHttp = config.allowHttp ?? config.rpcUrl.startsWith("http://");
+    // Insecure HTTP is disabled by default. Callers must explicitly opt in via
+    // `allowHttp: true` for local development endpoints.
+    this.allowHttp = config.allowHttp ?? false;
   }
 
   private async simulateCall(method: string, ...args: xdr.ScVal[]): Promise<xdr.ScVal | null> {
@@ -244,10 +246,16 @@ export class GeneratedLinkoraClient {
     return scValToNative(retval) as GovConfig;
   }
 
-  async getPoolAdmins(pool_id: string): Promise<string[]> {
+  async getPoolAdmins(pool_id: string): Promise<string[] | null> {
     const retval = await this.simulateCall("get_pool_admins", scvSymbol(pool_id));
-    if (!retval) return [];
-    return scValToNative(retval) as string[];
+    if (!retval) return null;
+    try {
+      const raw = scValToNative(retval);
+      return raw == null ? null : (raw as string[]);
+    } catch (e) {
+      if (e instanceof NotFoundError) return null;
+      throw e;
+    }
   }
 
   async effectiveQuorum(proposal_id: bigint): Promise<number> {
