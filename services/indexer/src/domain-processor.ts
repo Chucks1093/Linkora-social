@@ -31,6 +31,7 @@ import { handlePoolCreated, handlePoolDeposit, handlePoolWithdraw } from "./hand
 import { Database } from "./db";
 import { dispatchNotificationForBusEvent } from "./notifications/events";
 import { scValToNative, xdr } from "@stellar/stellar-sdk";
+import { logger } from "./logger";
 
 const TOPIC_FOLLOW = "follow";
 const TOPIC_UNFOLLOW = "unfollow";
@@ -49,6 +50,25 @@ const TOPIC_POST_CREATED = "post_created";
 const TOPIC_POST_DELETED = "post_deleted";
 const TOPIC_PROFILE_DELETED = "profile_deleted";
 
+export const DOMAIN_EVENT_TOPICS = {
+  profiles: {
+    creates: [TOPIC_PROFILE_SET],
+    deletes: [TOPIC_PROFILE_DELETED],
+  },
+  posts: {
+    creates: [TOPIC_POST_CREATED],
+    deletes: [],
+  },
+  tips: {
+    creates: [TOPIC_TIP, TOPIC_TIP_RECEIVED],
+    deletes: [],
+  },
+  follows: {
+    creates: [TOPIC_FOLLOW],
+    deletes: [TOPIC_UNFOLLOW],
+  },
+} as const;
+
 function toBusEvent(ev: IngestEvent): import("./bus").BusEvent {
   return {
     type: ev.type,
@@ -60,10 +80,34 @@ function toBusEvent(ev: IngestEvent): import("./bus").BusEvent {
   };
 }
 
+/**
+ * Thrown by `asBigInt` when a Stellar event field can't be parsed as a
+ * number. Caught in `createDomainProcessor` so the malformed event is
+ * skipped (and logged) instead of silently persisting a phantom
+ * id/amount of 0.
+ */
+export class MalformedEventValueError extends Error {
+  constructor(
+    message: string,
+    public readonly rawValue: unknown
+  ) {
+    super(message);
+    this.name = "MalformedEventValueError";
+  }
+}
+
 function asBigInt(value: unknown): bigint {
-  return typeof value === "bigint"
-    ? value
-    : BigInt(Number.isFinite(Number(value)) ? Number(value) : 0);
+  if (typeof value === "bigint") return value;
+
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    throw new MalformedEventValueError(
+      `Expected a numeric value for BigInt conversion, got: ${JSON.stringify(value)}`,
+      value
+    );
+  }
+
+  return BigInt(numeric);
 }
 
 function asString(value: unknown): string {
@@ -120,6 +164,33 @@ export function createDomainProcessor(
   db?: Database
 ): (client: PgClientLike, event: IngestEvent) => Promise<void> {
   return async (client: PgClientLike, event: IngestEvent): Promise<void> => {
+    try {
+      await processEvent(client, event);
+    } catch (err) {
+      if (err instanceof MalformedEventValueError) {
+        // The whole batch shares one DB transaction (see pipeline.ts), so
+        // rethrowing here would roll back every event in the batch and,
+        // since the malformed event never advances, retry it forever. Log
+        // and skip just this event instead — its raw row is still recorded
+        // in `raw_events` and the cursor still advances.
+        logger.warn(
+          {
+            err: err.message,
+            rawValue: err.rawValue,
+            ledgerSequence: event.ledgerSequence,
+            eventIndex: event.eventIndex,
+            contractId: event.contractId,
+            topic: event.topic,
+          },
+          "Skipping malformed event: could not parse numeric field"
+        );
+        return;
+      }
+      throw err;
+    }
+  };
+
+  async function processEvent(client: PgClientLike, event: IngestEvent): Promise<void> {
     // Decode topics and data so they work with both real RPC XDR and unit test JS objects
     const decodedTopics = decodeTopics(event.topic);
     let data = decodeData(event.data);
@@ -466,5 +537,5 @@ export function createDomainProcessor(
       default:
         break;
     }
-  };
+  }
 }

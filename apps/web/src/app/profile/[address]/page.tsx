@@ -76,6 +76,12 @@ export default function ProfilePage() {
     followingCount: state.status === "success" ? state.data.followingCount : 0,
   });
 
+  //  const followState_2 = useOptimisticFollow(currentUserAddress, address, {
+  //   isFollowing: state.status === "success" ? state.data.isFollowing : false,
+  //   followersCount: state.status === "success" ? state.data.followersCount : 0,
+  //   followingCount: state.status === "success" ? state.data.followingCount : 0,
+  // });
+
   /* ── Live event subscriptions ───────────────────────────────────────── */
 
   useWatchAddress(address);
@@ -205,6 +211,13 @@ export default function ProfilePage() {
         }
       );
       setIsBlocked((prev) => !prev);
+      // Keep the shared blocked list (/settings) in sync so unblocking or
+      // blocking from a profile card is reflected immediately everywhere.
+      if (isBlocked) {
+        removeFromBlockedList(address);
+      } else {
+        addToBlockedList(address);
+      }
       setMenuOpen(false);
     } catch (error) {
       console.error("Block/unblock failed:", error);

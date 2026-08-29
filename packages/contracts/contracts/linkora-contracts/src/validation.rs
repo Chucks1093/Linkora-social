@@ -3,13 +3,36 @@ use soroban_sdk::{Address, BytesN, Env, String, Vec};
 
 use crate::{GovParameter, ReportStatus};
 
-pub const MAX_NAME_LEN: u32 = 50;
-pub const MAX_CONTENT_LEN: u32 = 2_000;
+pub const MAX_NAME_LEN: u32 = 32;
+pub const MIN_NAME_LEN: u32 = 3;
+pub const MAX_BIO_LEN: u32 = 500;
+pub const MAX_CONTENT_LEN: u32 = 280;
 pub const MAX_PROTOCOL_AMOUNT: i128 = 1_000_000_000_000_000_000_000_000_000_000_000_000;
 pub const MAX_FEE_BPS: u32 = 10_000;
 pub const MAX_QUORUM: u32 = 100;
 const ZERO_ACCOUNT_ADDRESS: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 const ZERO_CONTRACT_ADDRESS: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+// Reserved usernames that cannot be claimed
+const RESERVED_WORDS: &[&str] = &[
+    "admin",
+    "system",
+    "moderator",
+    "bot",
+    "root",
+    "support",
+    "help",
+    "feedback",
+    "contact",
+    "info",
+    "status",
+    "health",
+    "api",
+    "app",
+    "web",
+    "mobile",
+    "linkora",
+];
 
 #[macro_export]
 macro_rules! require_with_error {
@@ -53,12 +76,68 @@ fn validate_string_max_len(env: &Env, label: &str, value: &String, max: u32) {
     );
 }
 
+/// Validates a username against the contract's naming rules.
+///
+/// A valid username must:
+/// - Be at least `MIN_NAME_LEN` (3) characters long
+/// - Be at most `MAX_NAME_LEN` (32) characters long
+/// - Start with a letter (a–z, A–Z)
+/// - Contain only alphanumeric characters (a–z, A–Z, 0–9) and underscores (`_`)
+/// - Not be a reserved word (e.g., "admin", "system", "moderator")
+///
+/// # Panics
+///
+/// Panics with a descriptive error message on the first violated rule.
 pub fn validate_username(env: &Env, username: &String) {
-    validate_string_max_len(env, "username", username, MAX_NAME_LEN);
-}
+    // Check minimum length
+    require_with_error!(
+        env,
+        username.len() >= MIN_NAME_LEN,
+        format!("username must be at least {MIN_NAME_LEN} characters")
+    );
 
-pub fn validate_content(env: &Env, content: &String) {
-    validate_string_max_len(env, "content", content, MAX_CONTENT_LEN);
+    // Check maximum length
+    validate_string_max_len(env, "username", username, MAX_NAME_LEN);
+
+    // Check that first character is a letter
+    let username_bytes = username.to_bytes();
+    if let Some(first_byte) = username_bytes.first() {
+        require_with_error!(
+            env,
+            first_byte.is_ascii_alphabetic(),
+            "username must start with a letter"
+        );
+    }
+
+    // Check for alphanumeric and underscore only
+    for byte in username_bytes.iter() {
+        let is_valid = byte.is_ascii_lowercase()
+            || byte.is_ascii_uppercase()
+            || byte.is_ascii_digit()
+            || byte == b'_';
+
+        require_with_error!(
+            env,
+            is_valid,
+            "username can only contain alphanumeric characters and underscores"
+        );
+    }
+
+    // Check for reserved words (case-insensitive). Usernames are ASCII-only
+    // (enforced above), so a byte-wise ASCII lowercase is sufficient here.
+    let mut lower = [0u8; MAX_NAME_LEN as usize];
+    let len = username_bytes.len() as usize;
+    username_bytes.copy_into_slice(&mut lower[..len]);
+    for b in lower[..len].iter_mut() {
+        b.make_ascii_lowercase();
+    }
+    for reserved in RESERVED_WORDS.iter() {
+        require_with_error!(
+            env,
+            &lower[..len] != reserved.as_bytes(),
+            format!("username '{reserved}' is reserved and cannot be used")
+        );
+    }
 }
 
 pub fn validate_amount(env: &Env, label: &str, amount: i128) {
@@ -118,4 +197,10 @@ pub fn validate_report_verdict(env: &Env, verdict: &ReportStatus) {
         !matches!(verdict, ReportStatus::Pending),
         "verdict must be upheld or dismissed"
     );
+}
+
+/// Rejects a report where the reporter is also the post author, preventing
+/// self-reporting from being used to bury one's own content.
+pub fn validate_reporter_can_report(env: &Env, reporter: &Address, author: &Address) {
+    require_with_error!(env, reporter != author, "cannot report own post");
 }

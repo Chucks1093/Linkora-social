@@ -18,7 +18,7 @@
  */
 
 import http from "http";
-import { Pool } from "pg";
+import { InstrumentedPool } from "./instrumented-pool";
 import { streamEvents, backfillStartupGap, RawEvent, BatchProcessor } from "./stream";
 import { IngestPipeline, IngestEvent } from "./pipeline";
 import { bus } from "./bus";
@@ -28,11 +28,16 @@ import { attachNotificationDispatcher } from "./notifications/events";
 import { NotificationService, PostgresDeviceTokenStore } from "./notifications/service";
 import { createApp } from "./api";
 import { createDomainProcessor } from "./domain-processor";
+import { saveStateRoot } from "./stateRoot";
 import { PostgresDatabase } from "./postgres-db";
 import { ScoreRefreshService } from "./score-refresh";
 import { HealthMonitor } from "./services/health-monitor";
 import { BackfillCoordinator } from "./services/backfill-coordinator";
 import { loadConfig } from "./config";
+import { GracefulShutdown } from "./graceful-shutdown";
+import { logger } from "./logger";
+import { initRateLimiter } from "./middleware/rateLimit";
+import { RawEventsRetentionManager } from "./retention";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -47,31 +52,134 @@ const SCORE_REFRESH_INTERVAL_MINUTES = cfg.scoreRefreshIntervalMinutes;
 
 // ── Database ──────────────────────────────────────────────────────────────────
 
-const pgPool = new Pool({ connectionString: DATABASE_URL });
+const STATEMENT_TIMEOUT_MS = parseInt(process.env.STATEMENT_TIMEOUT_MS || "30000", 10);
+const LOCK_TIMEOUT_MS = parseInt(process.env.LOCK_TIMEOUT_MS || "10000", 10);
+const SLOW_QUERY_THRESHOLD_MS = parseInt(process.env.SLOW_QUERY_THRESHOLD_MS || "5000", 10);
+const POOL_STATS_LOG_INTERVAL_MS = parseInt(process.env.DB_POOL_STATS_INTERVAL_MS || "60000", 10);
+
+const pgPool = new InstrumentedPool(SLOW_QUERY_THRESHOLD_MS, {
+  connectionString: DATABASE_URL,
+  statement_timeout: STATEMENT_TIMEOUT_MS,
+  lock_timeout: LOCK_TIMEOUT_MS,
+  max: cfg.dbPool.max,
+  idleTimeoutMillis: cfg.dbPool.idleTimeoutMs,
+  connectionTimeoutMillis: cfg.dbPool.connectionTimeoutMs,
+  min: cfg.pgPoolMin,
+});
+
+logger.info(
+  {
+    max: cfg.dbPool.max,
+    idleTimeoutMs: cfg.dbPool.idleTimeoutMs,
+    connectionTimeoutMs: cfg.dbPool.connectionTimeoutMs,
+  },
+  "PostgreSQL pool configured"
+);
+
+// Periodically log pool utilisation so saturation is visible before it
+// manifests as connection-timeout errors under load.
+const poolStatsTimer = setInterval(() => {
+  logger.info(
+    {
+      totalCount: pgPool.totalCount,
+      idleCount: pgPool.idleCount,
+      waitingCount: pgPool.waitingCount,
+    },
+    "PostgreSQL pool stats"
+  );
+}, POOL_STATS_LOG_INTERVAL_MS);
+poolStatsTimer.unref();
+
 const notificationService = new NotificationService({
   deviceTokenStore: new PostgresDeviceTokenStore(pgPool),
   pool: pgPool,
 });
 const scoreRefreshService = new ScoreRefreshService(pgPool, SCORE_REFRESH_INTERVAL_MINUTES);
+const rawEventsRetentionManager = new RawEventsRetentionManager(pgPool, cfg.rawEventsRetention);
 
 /**
  * Idempotently ensure the staging table and cursor exist. Mirrors
- * migrations/006_raw_events.sql for dev/test environments that boot without a
- * separate migration step.
+ * migrations/006_raw_events.sql + 012_raw_events_partitioned.sql for dev/test
+ * environments that boot without a separate migration step.
+ *
+ * When raw_events already exists as a plain (non-partitioned) heap table this
+ * function leaves it untouched — run migration 012 to convert it.  Fresh
+ * deployments get the partitioned layout from the start.
  */
 async function ensureSchema(): Promise<void> {
-  await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS raw_events (
-      id              BIGSERIAL   NOT NULL,
-      ledger_sequence BIGINT      NOT NULL,
-      event_index     INT         NOT NULL,
-      contract_id     TEXT        NOT NULL,
-      topic           TEXT[]      NOT NULL,
-      data            JSONB       NOT NULL,
-      processed_at    TIMESTAMPTZ,
-      PRIMARY KEY (ledger_sequence, event_index)
-    )
-  `);
+  // ── raw_events ─────────────────────────────────────────────────────────────
+  // Only create the partitioned parent when raw_events does not yet exist at
+  // all.  If it already exists (partitioned or not) we leave it in place;
+  // migration 012 handles the conversion for existing deployments.
+  const rawEventsExists = await pgPool
+    .query<{ exists: boolean }>(`SELECT to_regclass('public.raw_events') IS NOT NULL AS exists`)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .then((r: any) => r.rows[0]?.exists ?? false);
+
+  if (!rawEventsExists) {
+    // Create the partitioned parent.
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS raw_events (
+        id              BIGSERIAL   NOT NULL,
+        ledger_sequence BIGINT      NOT NULL,
+        event_index     INT         NOT NULL,
+        contract_id     TEXT        NOT NULL,
+        topic           TEXT[]      NOT NULL,
+        data            JSONB       NOT NULL,
+        processed_at    TIMESTAMPTZ,
+        PRIMARY KEY (ledger_sequence, event_index)
+      ) PARTITION BY RANGE (ledger_sequence)
+    `);
+
+    // Indexes on the parent — propagated to every child partition (PG 11+).
+    // PG requires all partitioning columns in a unique index, so we include
+    // ledger_sequence alongside id. Names match migration 012.
+    await pgPool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_events_id1
+        ON raw_events (id, ledger_sequence)
+    `);
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS idx_raw_events_contract_id1
+        ON raw_events (contract_id)
+    `);
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS idx_raw_events_ledger1
+        ON raw_events (ledger_sequence)
+    `);
+    // Partial index for crash-recovery: only unprocessed rows are indexed.
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS idx_raw_events_unprocessed
+        ON raw_events (ledger_sequence, event_index)
+        WHERE processed_at IS NULL
+    `);
+
+    // Default catch-all partition (absorbs inserts not covered by a named bucket).
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS raw_events_default
+        PARTITION OF raw_events DEFAULT
+    `);
+
+    // Seed the first two 1M-ledger buckets so initial inserts never hit the
+    // default partition.  The retention manager creates further buckets
+    // proactively as the indexer cursor advances.
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS raw_events_p0_1000000
+        PARTITION OF raw_events FOR VALUES FROM (0) TO (1000000)
+    `);
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS raw_events_p1000000_2000000
+        PARTITION OF raw_events FOR VALUES FROM (1000000) TO (2000000)
+    `);
+  } else {
+    // Table exists — ensure at minimum the partial index is present.
+    // (It will be a no-op if the index already exists.)
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS idx_raw_events_unprocessed
+        ON raw_events (ledger_sequence, event_index)
+        WHERE processed_at IS NULL
+    `);
+  }
+
   await pgPool.query(`
     CREATE TABLE IF NOT EXISTS indexer_cursor (
       id               TEXT        PRIMARY KEY,
@@ -172,10 +280,13 @@ function toIngestEvent(event: RawEvent): IngestEvent {
   };
 }
 
-// ── HTTP + WebSocket server ──────────────────────────────────────────────────
+// ── Graceful shutdown ────────────────────────────────────────────────────────
 
 const healthMonitor = new HealthMonitor(pgPool, STELLAR_RPC_URL);
-const apiApp = createApp(new PostgresDatabase(pgPool), pgPool, healthMonitor);
+const abortController = new AbortController();
+const shutdownFlag = { active: false };
+
+const apiApp = createApp(new PostgresDatabase(pgPool), pgPool, healthMonitor, shutdownFlag);
 const httpServer = http.createServer(apiApp);
 
 const wsHandle = attachWebSocketServer(httpServer, bus, { path: "/ws" });
@@ -183,33 +294,36 @@ const detachNotificationDispatcher = attachNotificationDispatcher(bus, pgPool, n
 
 // ── Lifecycle control ────────────────────────────────────────────────────────
 
-const abortController = new AbortController();
-let shuttingDown = false;
+const gracefulShutdown = new GracefulShutdown({
+  httpServer,
+  pgPool,
+  wsHandle,
+  abortController,
+  scoreRefreshStop: () => scoreRefreshService.stop(),
+  detachNotificationDispatcher,
+  shutdownTimeoutMs: cfg.shutdownTimeoutMs,
+  onSignal: (signal) => {
+    logger.info({ signal }, "Graceful shutdown initiated");
+    healthMonitor.markShuttingDown();
+    clearInterval(poolStatsTimer);
+    rawEventsRetentionManager.stop();
+  },
+  shutdownFlag,
+});
 
-async function shutdown(signal: string): Promise<void> {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  console.log(`[indexer] Received ${signal}, shutting down…`);
-  healthMonitor.markShuttingDown();
-  abortController.abort();
-  scoreRefreshService.stop();
-  detachNotificationDispatcher();
-  await wsHandle.close();
-  httpServer.close();
-  await pgPool.end();
-  console.log("[indexer] Shutdown complete.");
-}
-
-process.on("SIGTERM", () => void shutdown("SIGTERM"));
-process.on("SIGINT", () => void shutdown("SIGINT"));
+gracefulShutdown.registerSignals();
 
 // ── Core runner ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  console.log("[indexer] Starting Linkora indexer");
-  console.log(`[indexer] RPC:        ${STELLAR_RPC_URL}`);
-  console.log(`[indexer] Contract:   ${CONTRACT_ID}`);
-  console.log(`[indexer] From ledger: ${START_LEDGER}`);
+  logger.info("Starting Linkora indexer");
+  logger.info(
+    { rpcUrl: STELLAR_RPC_URL, contractId: CONTRACT_ID, startLedger: START_LEDGER },
+    "Config"
+  );
+
+  // Initialise HTTP rate limiter (upgrades to Redis store when REDIS_URL is set).
+  await initRateLimiter();
 
   await ensureSchema();
 
@@ -221,6 +335,15 @@ async function main(): Promise<void> {
       notificationService,
       new PostgresDatabase(pgPool)
     ),
+    // Publish the state root only after this batch's transaction has
+    // committed, so the stored root always reflects a fully-applied ledger
+    // rather than a partially-applied one.
+    onCommit: (cursor): Promise<void> =>
+      saveStateRoot(pgPool, cursor).then(
+        () => {},
+        (err) =>
+          logger.warn({ err, ledgerSequence: cursor }, "Failed to publish state root after commit")
+      ),
   });
 
   const processBatch: BatchProcessor = async (events) => {
@@ -306,7 +429,7 @@ async function main(): Promise<void> {
         }
       }
     } catch (err) {
-      console.warn("[indexer] Startup gap check failed (continuing):", err);
+      logger.warn({ err }, "Startup gap check failed (continuing)");
     }
   }
 
@@ -318,10 +441,15 @@ async function main(): Promise<void> {
   // Start score refresh service
   scoreRefreshService.start();
 
-  // Start gossip in the background.
-  startGossip(pgPool, abortController.signal).catch((err) =>
-    console.error("[gossip] Fatal error:", err)
-  );
+  // Start raw_events retention / partition management
+  rawEventsRetentionManager.start();
+
+  // Start gossip in the background with auto-replay support.
+  startGossip(pgPool, abortController.signal, {
+    rpcUrl: STELLAR_RPC_URL,
+    contractId: CONTRACT_ID,
+    processBatch,
+  }).catch((err) => console.error("[gossip] Fatal error:", err));
 
   await streamEvents(
     {
@@ -339,14 +467,11 @@ async function main(): Promise<void> {
     abortController.signal
   );
 
-  await wsHandle.close();
-  detachNotificationDispatcher();
-  httpServer.close();
-  await pgPool.end();
-  console.log("[indexer] Shutdown complete.");
+  logger.info("Event stream ended, initiating shutdown");
+  await gracefulShutdown.shutdown("STREAM_END");
 }
 
 main().catch((err) => {
-  console.error("[indexer] Fatal error:", err);
+  logger.error({ err }, "Fatal error");
   process.exit(1);
 });

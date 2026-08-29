@@ -3,6 +3,9 @@
  */
 
 import { Pool } from "pg";
+import fs from "fs";
+import path from "path";
+import { logger } from "./logger";
 
 export interface DbMessage {
   id: string;
@@ -22,7 +25,8 @@ const IDEMPOTENCY_PENDING_STATUS = 0;
 export type IdempotencyClaimResult =
   | { status: "claimed" }
   | { status: "in_progress" }
-  | { status: "cached"; responseStatus: number; responseBody: unknown };
+  | { status: "cached"; responseStatus: number; responseBody: unknown }
+  | { status: "conflict" };
 
 class Database {
   private pool: Pool;
@@ -37,59 +41,51 @@ class Database {
   }
 
   async init(): Promise<void> {
-    await this.createTables();
-    console.log("Database initialized successfully");
+    await this.runMigrations();
+    logger.info("Database initialized successfully");
   }
 
   async ping(): Promise<void> {
     await this.pool.query("SELECT 1");
   }
 
-  private async createTables(): Promise<void> {
-    const createMessagesTable = `
-      CREATE TABLE IF NOT EXISTS dm_messages (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        conversation_id VARCHAR(64) NOT NULL,
-        sender VARCHAR(56) NOT NULL,
-        recipient VARCHAR(56) NOT NULL,
-        ciphertext_b64 TEXT NOT NULL,
-        message_index INTEGER NOT NULL,
-        timestamp BIGINT NOT NULL,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        
-        CONSTRAINT unique_sender_message_index UNIQUE (sender, recipient, message_index)
+  private async runMigrations(): Promise<void> {
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        filename   VARCHAR(255) PRIMARY KEY,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
-    `;
+    `);
 
-    const createIndexes = `
-      CREATE INDEX IF NOT EXISTS idx_dm_messages_conversation_created
-        ON dm_messages (conversation_id, created_at DESC);
+    const appliedResult = await this.pool.query(
+      "SELECT filename FROM schema_migrations ORDER BY filename"
+    );
+    const applied = new Set(appliedResult.rows.map((r) => r.filename));
 
-      CREATE INDEX IF NOT EXISTS idx_dm_messages_created_at
-        ON dm_messages (created_at);
+    const migrationsDir = path.resolve(__dirname, "../migrations");
+    const files = fs
+      .readdirSync(migrationsDir)
+      .filter((f) => f.endsWith(".sql"))
+      .sort();
 
-      CREATE INDEX IF NOT EXISTS idx_dm_messages_timestamp
-        ON dm_messages (timestamp);
-    `;
+    for (const filename of files) {
+      if (applied.has(filename)) continue;
 
-    const createIdempotencyTable = `
-      CREATE TABLE IF NOT EXISTS message_idempotency (
-        idempotency_key UUID PRIMARY KEY,
-        response_status INT NOT NULL,
-        response_body JSONB NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `;
+      const sql = fs.readFileSync(path.join(migrationsDir, filename), "utf-8");
 
-    const createIdempotencyIndex = `
-      CREATE INDEX IF NOT EXISTS idx_message_idempotency_created_at
-        ON message_idempotency (created_at);
-    `;
-
-    await this.pool.query(createMessagesTable);
-    await this.pool.query(createIndexes);
-    await this.pool.query(createIdempotencyTable);
-    await this.pool.query(createIdempotencyIndex);
+      logger.info({ migration: filename }, "Applying migration");
+      await this.pool.query("BEGIN");
+      try {
+        await this.pool.query(sql);
+        await this.pool.query("INSERT INTO schema_migrations (filename) VALUES ($1)", [filename]);
+        await this.pool.query("COMMIT");
+        logger.info({ migration: filename }, "Migration applied");
+      } catch (error) {
+        await this.pool.query("ROLLBACK");
+        logger.error({ migration: filename, err: error }, "Migration failed");
+        throw error;
+      }
+    }
   }
 
   async insertMessage(
@@ -182,59 +178,119 @@ class Database {
   async deleteExpiredMessages(ttlDays: number): Promise<number> {
     const query = `
       DELETE FROM dm_messages
-      WHERE created_at < NOW() - INTERVAL '${ttlDays} days'
+      WHERE created_at < NOW() - $1::integer * INTERVAL '1 day'
     `;
 
-    const result = await this.pool.query(query);
+    const result = await this.pool.query(query, [ttlDays]);
     return result.rowCount || 0;
   }
 
   /**
-   * Atomically claim an idempotency key for processing.
+   * Atomically claim an idempotency key for processing, scoped to the
+   * authenticated sender. Two different senders reusing the same
+   * client-generated key are independent — the key alone is not a global
+   * lock.
    *
-   * - 'claimed': no prior attempt exists; the caller owns processing and
-   *   must call `completeIdempotencyKey` once it has a response.
-   * - 'cached': a prior attempt already completed; the caller should replay
-   *   the stored response instead of reprocessing.
-   * - 'in_progress': a concurrent request already claimed this key and
-   *   hasn't finished yet.
+   * - 'claimed': no prior attempt exists for this (sender, key); the caller
+   *   owns processing and must call `completeIdempotencyKey` once it has a
+   *   response.
+   * - 'cached': a prior attempt for this (sender, key) with the same payload
+   *   already completed; the caller should replay the stored response
+   *   instead of reprocessing.
+   * - 'in_progress': a concurrent request already claimed this (sender, key)
+   *   with the same payload and hasn't finished yet.
+   * - 'conflict': this (sender, key) pair was already used with a
+   *   *different* payload.
    */
-  async claimIdempotencyKey(key: string): Promise<IdempotencyClaimResult> {
+  async claimIdempotencyKey(
+    senderAddress: string,
+    key: string,
+    requestFingerprint: string
+  ): Promise<IdempotencyClaimResult> {
     const insertQuery = `
-      INSERT INTO message_idempotency (idempotency_key, response_status, response_body)
-      VALUES ($1, $2, '{}'::jsonb)
-      ON CONFLICT (idempotency_key) DO NOTHING
+      INSERT INTO message_idempotency
+        (sender_address, idempotency_key, response_status, response_body, request_fingerprint)
+      VALUES ($1, $2, $3, '{}'::jsonb, $4)
+      ON CONFLICT (sender_address, idempotency_key) DO NOTHING
       RETURNING idempotency_key
     `;
 
-    const insertResult = await this.pool.query(insertQuery, [key, IDEMPOTENCY_PENDING_STATUS]);
+    const insertResult = await this.pool.query(insertQuery, [
+      senderAddress,
+      key,
+      IDEMPOTENCY_PENDING_STATUS,
+      requestFingerprint,
+    ]);
     if (insertResult.rowCount && insertResult.rowCount > 0) {
       return { status: "claimed" };
     }
 
-    const cached = await this.getIdempotencyResponse(key);
-    if (cached) {
-      return {
-        status: "cached",
-        responseStatus: cached.responseStatus,
-        responseBody: cached.responseBody,
-      };
+    const existing = await this.getIdempotencyRecord(senderAddress, key);
+    if (!existing) {
+      // The row was pruned (expired) between the failed insert and this
+      // read; treat it as a concurrent claim still settling.
+      return { status: "in_progress" };
     }
-    return { status: "in_progress" };
+
+    if (existing.requestFingerprint !== requestFingerprint) {
+      return { status: "conflict" };
+    }
+
+    if (existing.responseStatus === IDEMPOTENCY_PENDING_STATUS) {
+      return { status: "in_progress" };
+    }
+
+    return {
+      status: "cached",
+      responseStatus: existing.responseStatus,
+      responseBody: existing.responseBody,
+    };
+  }
+
+  /**
+   * Fetch the idempotency record for (senderAddress, key), pending or
+   * completed, along with the fingerprint of the payload that claimed it.
+   */
+  private async getIdempotencyRecord(
+    senderAddress: string,
+    key: string
+  ): Promise<{
+    responseStatus: number;
+    responseBody: unknown;
+    requestFingerprint: string;
+  } | null> {
+    const query = `
+      SELECT response_status, response_body, request_fingerprint
+      FROM message_idempotency
+      WHERE sender_address = $1 AND idempotency_key = $2
+    `;
+    const result = await this.pool.query(query, [senderAddress, key]);
+    if (result.rowCount === 0) return null;
+
+    return {
+      responseStatus: result.rows[0].response_status,
+      responseBody: result.rows[0].response_body,
+      requestFingerprint: result.rows[0].request_fingerprint,
+    };
   }
 
   /**
    * Fetch a completed (non-pending) idempotency response, if one exists.
    */
   async getIdempotencyResponse(
+    senderAddress: string,
     key: string
   ): Promise<{ responseStatus: number; responseBody: unknown } | null> {
     const query = `
       SELECT response_status, response_body
       FROM message_idempotency
-      WHERE idempotency_key = $1 AND response_status <> $2
+      WHERE sender_address = $1 AND idempotency_key = $2 AND response_status <> $3
     `;
-    const result = await this.pool.query(query, [key, IDEMPOTENCY_PENDING_STATUS]);
+    const result = await this.pool.query(query, [
+      senderAddress,
+      key,
+      IDEMPOTENCY_PENDING_STATUS,
+    ]);
     if (result.rowCount === 0) return null;
 
     return {
@@ -247,23 +303,28 @@ class Database {
    * Record the final response for a claimed idempotency key so future
    * duplicate submissions can replay it instead of reprocessing.
    */
-  async completeIdempotencyKey(key: string, status: number, body: unknown): Promise<void> {
+  async completeIdempotencyKey(
+    senderAddress: string,
+    key: string,
+    status: number,
+    body: unknown
+  ): Promise<void> {
     const query = `
       UPDATE message_idempotency
-      SET response_status = $2, response_body = $3
-      WHERE idempotency_key = $1
+      SET response_status = $3, response_body = $4
+      WHERE sender_address = $1 AND idempotency_key = $2
     `;
-    await this.pool.query(query, [key, status, JSON.stringify(body)]);
+    await this.pool.query(query, [senderAddress, key, status, JSON.stringify(body)]);
   }
 
   async deleteExpiredIdempotencyKeys(ttlHours: number): Promise<number> {
     const hours = Math.max(0, Math.floor(ttlHours));
     const query = `
       DELETE FROM message_idempotency
-      WHERE created_at < NOW() - INTERVAL '${hours} hours'
+      WHERE created_at < NOW() - $1::integer * INTERVAL '1 hour'
     `;
 
-    const result = await this.pool.query(query);
+    const result = await this.pool.query(query, [hours]);
     return result.rowCount || 0;
   }
 

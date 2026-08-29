@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { WebSocket } from "ws";
 import { Database, DbMessage } from "./database";
 import { AuthService } from "./auth";
+import { messageAuthMiddleware, addressOwnershipMiddleware } from "./middleware/auth";
 import { validateBody, validateQuery, validateParams } from "./middleware/validate";
 import {
   SendMessageSchema,
@@ -11,32 +12,85 @@ import {
   parseCursor,
   createCursor,
 } from "./validation";
+import { stellarAddressSchema } from "@linkora/types/src/schemas";
 import { createConversationId, sanitizeError } from "./utils";
 import { z, ZodError } from "zod";
 import { idempotencyMiddleware } from "./middleware/idempotency";
+import { logger } from "./logger";
 import {
   validationError,
   unauthorizedError,
   conflictError,
   internalError,
 } from "@linkora/types/src/errors";
-
-// ── WebSocket client registry (address → set of sockets) ─────────────────────
+import type { InflightCounter } from "./inflight-counter";
 
 const wsClients = new Map<string, Set<WebSocket>>();
+const typingRateLimitMap = new Map<string, number>();
 
-export function registerWsClient(address: string, ws: WebSocket): void {
+/**
+ * Register a WebSocket client for a given Stellar address.
+ *
+ * `inflightCounter` is optional to preserve backwards-compatibility with
+ * tests that call this function without a counter.  When provided, every DB
+ * write that is triggered by an incoming WS message increments the counter
+ * before the write and decrements it in the `finally` block, so the
+ * graceful-shutdown handler can wait for all writes to complete.
+ */
+export function registerWsClient(
+  address: string,
+  ws: WebSocket,
+  inflightCounter?: InflightCounter
+): void {
   if (!wsClients.has(address)) wsClients.set(address, new Set());
   wsClients.get(address)!.add(ws);
 
   ws.on("message", (data) => {
     try {
       const payload = JSON.parse(data.toString());
-      if (payload.type === "typing_status" && typeof payload.recipient === "string") {
-        pushToRecipient(payload.recipient, {
-          type: "typing_status",
-          sender: address,
-        });
+      if (payload.type === "typing_status") {
+        if (payload.sender && payload.sender !== address) {
+          logger.warn(
+            { authenticatedAddress: address, payloadSender: payload.sender },
+            "Typing notification sender mismatch abuse detected"
+          );
+          return;
+        }
+
+        const recipient = payload.recipient;
+        if (typeof recipient !== "string" || !stellarAddressSchema.safeParse(recipient).success) {
+          logger.warn(
+            { authenticatedAddress: address, recipient },
+            "Invalid typing notification recipient address"
+          );
+          return;
+        }
+
+        const rateLimitKey = `${address}:${recipient}`;
+        const lastSent = typingRateLimitMap.get(rateLimitKey) || 0;
+        const now = Date.now();
+        if (now - lastSent < 3000) {
+          logger.warn(
+            { authenticatedAddress: address, recipient },
+            "Typing notification rate limit exceeded"
+          );
+          return;
+        }
+        typingRateLimitMap.set(rateLimitKey, now);
+
+        // Track this DB write so the shutdown handler can wait for it.
+        inflightCounter?.increment();
+        // typing_status is push-only and does not touch the DB directly,
+        // so decrement immediately after dispatching.
+        try {
+          logger.info({ sender: address, recipient }, "Typing status notification dispatched");
+          pushToRecipient(recipient, {
+            type: "typing_status",
+            sender: address,
+          });
+        } finally {
+          inflightCounter?.decrement();
+        }
       }
     } catch (e) {
       // Ignore invalid JSON from clients
@@ -111,14 +165,21 @@ function handleRouteError(error: unknown, requestId: string): { status: number; 
   };
 }
 
-export function createRouter(database: Database, _authService: AuthService): Router {
+export function createRouter(database: Database, authService: AuthService): Router {
   const router = Router();
+  const messageAuth = messageAuthMiddleware(authService);
+  const addressAuth = addressOwnershipMiddleware(authService);
 
   /**
    * POST /messages - Submit an encrypted message
+   *
+   * Auth is applied here, scoped to this route, rather than via a global
+   * path-matching middleware — so it can never over-apply to unrelated
+   * routes (health checks, future public endpoints, etc).
    */
   router.post(
     "/messages",
+    messageAuth,
     idempotencyMiddleware(database),
     validateBody(SendMessageSchema),
     async (req: Request, res: Response) => {
@@ -136,9 +197,7 @@ export function createRouter(database: Database, _authService: AuthService): Rou
           messageData.timestamp
         );
 
-        console.log(
-          `[${req.requestId}] Message stored: ${messageId} (conversation: ${conversationId})`
-        );
+        logger.info({ requestId: req.requestId, messageId, conversationId }, "Message stored");
 
         pushToRecipient(messageData.recipient, {
           type: "new_message",
@@ -155,15 +214,23 @@ export function createRouter(database: Database, _authService: AuthService): Rou
           conversation_id: conversationId,
         });
       } catch (error) {
-        console.error(`[${req.requestId}] Message submission error:`, error);
+        logger.error({ requestId: req.requestId, error }, "Message submission error");
         const { status, body } = handleRouteError(error, req.requestId);
         res.status(status).json(body);
       }
     }
   );
 
+  /**
+   * GET /messages/:address - Fetch messages for the authenticated address.
+   *
+   * Verifies the caller owns `:address` via a signed Authorization header.
+   * Applied here, scoped to this route, instead of via a global path-matching
+   * middleware.
+   */
   router.get(
     "/messages/:address",
+    addressAuth,
     validateParams(AddressParamSchema),
     validateQuery(GetMessagesQuerySchema),
     async (req: Request, res: Response) => {
@@ -207,7 +274,7 @@ export function createRouter(database: Database, _authService: AuthService): Rou
           address,
         });
       } catch (error) {
-        console.error(`[${req.requestId}] Message retrieval error:`, error);
+        logger.error({ requestId: req.requestId, error }, "Message retrieval error");
         const { status, body } = handleRouteError(error, req.requestId);
         res.status(status).json(body);
       }
@@ -256,45 +323,12 @@ export function createRouter(database: Database, _authService: AuthService): Rou
           conversation_id: conversationId,
         });
       } catch (error) {
-        console.error(`[${req.requestId}] Message retrieval error:`, error);
+        logger.error({ requestId: req.requestId, error }, "Message retrieval error");
         const { status, body } = handleRouteError(error, req.requestId);
         res.status(status).json(body);
       }
     }
   );
-
-  router.get("/health", async (req: Request, res: Response) => {
-    try {
-      const stats = await database.getHealthStats();
-
-      res.json({
-        status: "healthy",
-        timestamp: new Date().toISOString(),
-        database: {
-          connected: true,
-          total_messages: stats.totalMessages,
-          messages_last_24h: stats.messagesLast24h,
-          oldest_message: stats.oldestMessage?.toISOString(),
-        },
-        service: {
-          name: "linkora-dm-relay",
-          version: "0.1.0",
-          uptime: process.uptime(),
-          ws_connected_clients: [...wsClients.values()].reduce((sum, s) => sum + s.size, 0),
-        },
-      });
-    } catch (error) {
-      console.error(`[${req.requestId}] Health check error:`, error);
-
-      res.status(503).json({
-        error: {
-          code: "SERVICE_UNAVAILABLE",
-          message: sanitizeError(error),
-          requestId: req.requestId,
-        },
-      });
-    }
-  });
 
   return router;
 }

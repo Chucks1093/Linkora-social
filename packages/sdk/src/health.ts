@@ -1,5 +1,6 @@
 import * as rpc from "@stellar/stellar-sdk/rpc";
-import type { RetryAttemptInfo, RetryReason } from "./utils/retry";
+import type { RetryAttemptInfo, RetryReason } from "./utils/retry.js";
+import { TimeoutError } from "./errors.js";
 
 export type ConnectionStatus = "connected" | "disconnected";
 export type ConnectionStatusCallback = (status: ConnectionStatus) => void;
@@ -41,6 +42,8 @@ export interface HealthCheckConfig {
   backoffMs?: number;
   /** Maximum backoff cap in ms. Default: 30000 */
   maxBackoffMs?: number;
+  /** Timeout in ms for individual health check pings. Default: 10000 */
+  pingTimeoutMs?: number;
 }
 
 /**
@@ -52,41 +55,84 @@ export class ConnectionHealthMonitor {
   private readonly intervalMs: number;
   private readonly backoffMs: number;
   private readonly maxBackoffMs: number;
+  private readonly pingTimeoutMs: number;
 
   private status: ConnectionStatus = "disconnected";
   private listeners: ConnectionStatusCallback[] = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
+  private hasChecked = false;
   private retryMetrics: RetryMetrics = emptyRetryMetrics();
+
+private boundResume = () => this.resume();
 
   constructor(rpcUrl: string, config: HealthCheckConfig = {}) {
     this.rpcUrl = rpcUrl;
     this.intervalMs = config.intervalMs ?? 30_000;
     this.backoffMs = config.backoffMs ?? 1_000;
     this.maxBackoffMs = config.maxBackoffMs ?? 30_000;
+    this.pingTimeoutMs = config.pingTimeoutMs ?? 10_000;
+
+    if (typeof window !== "undefined") {
+      window.addEventListener("online", this.boundResume);
+      document.addEventListener("visibilitychange", this.boundResume);
+    }
   }
 
-  /** Register a callback invoked whenever connection status changes. Starts the loop if not already running. */
-  onConnectionStatusChange(callback: ConnectionStatusCallback): void {
-    this.listeners.push(callback);
+  /**
+   * Register a callback invoked whenever connection status changes. Starts the loop if not
+   * already running. Re-registering the same callback reference is a no-op (it will not be
+   * invoked twice per status change), so it is safe to call this repeatedly with a stable
+   * callback — e.g. from a React effect that re-runs on every render.
+   *
+   * @returns An unsubscribe function that removes this listener.
+   */
+  onConnectionStatusChange(callback: ConnectionStatusCallback): () => void {
+    if (!this.listeners.includes(callback)) {
+      this.listeners.push(callback);
+    }
     this.start();
+    return () => {
+      this.listeners = this.listeners.filter((cb) => cb !== callback);
+    };
   }
 
   /** Perform a single health check ping against the RPC endpoint. */
   async healthCheck(): Promise<boolean> {
     try {
-      const server = new rpc.Server(this.rpcUrl);
-      await server.getLatestLedger();
-      return true;
+      // Insecure HTTP is disabled by default (safe-by-default). A health check
+      // against a plaintext endpoint will simply report disconnected unless the
+      // endpoint was explicitly opted-in when constructing the client.
+      const server = new rpc.Server(this.rpcUrl, {
+        allowHttp: false,
+      });
+      const result = await withTimeout(
+        server.getLatestLedger(),
+        this.pingTimeoutMs,
+        `Health check timed out after ${this.pingTimeoutMs}ms`
+      );
+      return result !== null;
     } catch {
       return false;
     }
+  }
+
+
+  /** Alias for start(). Useful for resuming after a sustained outage stops polling. */
+  resume(): void {
+    this.start();
+  }
+
+  /** Alias for start(). */
+  wake(): void {
+    this.start();
   }
 
   /** Start periodic health checks. Idempotent — safe to call multiple times. */
   start(): void {
     if (this.timer !== null) return; // already running
     this.stopped = false;
+    this.hasChecked = false;
     this.scheduleCheck(0);
   }
 
@@ -99,8 +145,23 @@ export class ConnectionHealthMonitor {
     }
   }
 
+  /** Destroy the monitor, stop all checks, clear listeners, and reset state. */
+  destroy(): void {
+    this.stop();
+    if (typeof window !== "undefined") {
+      window.removeEventListener("online", this.boundResume);
+      document.removeEventListener("visibilitychange", this.boundResume);
+    }
+    this.listeners = [];
+    this.status = "disconnected";
+    this.hasChecked = false;
+    this.retryMetrics = emptyRetryMetrics();
+    this._currentBackoff = 0;
+  }
+
   private scheduleCheck(delayMs: number): void {
-    this.timer = setTimeout(() => this.runCheck(), delayMs);
+    const baseJitter = delayMs === 0 ? Math.random() * this.backoffMs : delayMs * 0.2 * Math.random();
+    this.timer = setTimeout(() => this.runCheck(), delayMs + baseJitter);
   }
 
   private async runCheck(): Promise<void> {
@@ -109,13 +170,21 @@ export class ConnectionHealthMonitor {
     const ok = await this.healthCheck();
     const next: ConnectionStatus = ok ? "connected" : "disconnected";
 
-    if (next !== this.status) {
+    // Always emit the result of the first check so callers observe the
+    // initial connection state even when the RPC is unreachable from the start.
+    if (!this.hasChecked || next !== this.status) {
       this.status = next;
       for (const cb of this.listeners) cb(this.status);
     }
+    this.hasChecked = true;
 
     if (!this.stopped) {
-      this.scheduleCheck(ok ? this.intervalMs : this.nextBackoff());
+      if (!ok && this._currentBackoff >= this.maxBackoffMs) {
+        // Sustained outage reached max backoff cap. Stop probing until manual restart or network recovery event.
+        this.stop();
+      } else {
+        this.scheduleCheck(ok ? this.intervalMs : this.nextBackoff());
+      }
     }
   }
 
@@ -175,4 +244,20 @@ export class ConnectionHealthMonitor {
     }
     return this._currentBackoff;
   }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new TimeoutError(message, { timeoutMs: ms })), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
 }
