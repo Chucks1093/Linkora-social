@@ -28,6 +28,7 @@ export interface Post {
   created_ledger: number;
   deleted_ledger: number | null;
   content: string;
+  tags?: string[];
 }
 
 export interface Like {

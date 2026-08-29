@@ -9,6 +9,7 @@ import { stellarAddressSchema, cursorPaginationSchema } from "@linkora/types/src
 
 const exploreQuerySchema = cursorPaginationSchema.extend({
   cursor: z.coerce.number().optional(),
+  tag: z.string().optional(),
 });
 
 const followingFeedParamsSchema = z.object({
@@ -18,6 +19,7 @@ const followingFeedParamsSchema = z.object({
 const followingFeedQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
   cursor: z.string().optional(),
+  tag: z.string().optional(),
 });
 
 async function queryView<R extends QueryResultRow = QueryResultRow>(
@@ -99,7 +101,7 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
     "/explore",
     validateQuery(exploreQuerySchema),
     async (req: Request, res: Response): Promise<void> => {
-      const { limit, cursor } = req.query as unknown as z.infer<typeof exploreQuerySchema>;
+      const { limit, cursor, tag } = req.query as unknown as z.infer<typeof exploreQuerySchema>;
 
       if (!isPgPool(dbOrPg)) {
         const { posts } = await (dbOrPg as Database).listPosts({ limit, offset: cursor ?? 0 });
@@ -112,17 +114,25 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
           id,
           author,
           content,
+          tags,
           tip_total,
           like_count,
           created_at,
           score
         FROM post_scores
+        WHERE 1=1
       `;
       const params: (number | string)[] = [];
       let paramIndex = 1;
 
+      if (tag) {
+        query += ` AND $${paramIndex} = ANY(tags)`;
+        params.push(tag.toLowerCase());
+        paramIndex++;
+      }
+
       if (cursor !== undefined) {
-        query += ` WHERE score < $${paramIndex}`;
+        query += ` AND score < $${paramIndex}`;
         params.push(cursor);
         paramIndex++;
       }
@@ -137,6 +147,7 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
           id: row.id,
           author: row.author,
           content: row.content,
+          tags: row.tags || [],
           tip_total: row.tip_total,
           like_count: row.like_count,
           created_at: row.created_at,
@@ -154,7 +165,7 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
     validateQuery(followingFeedQuerySchema),
     async (req: Request, res: Response): Promise<void> => {
       const address = req.params.address;
-      const { limit, cursor } = req.query as unknown as z.infer<typeof followingFeedQuerySchema>;
+      const { limit, cursor, tag } = req.query as unknown as z.infer<typeof followingFeedQuerySchema>;
 
       if (!isPgPool(dbOrPg)) {
         const { posts } = await (dbOrPg as Database).listPosts({ limit, offset: 0 });
@@ -167,6 +178,7 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
           p.id,
           p.author,
           p.content,
+          p.tags,
           p.tip_total,
           p.like_count,
           p.created_at
@@ -179,6 +191,12 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
       `;
       const params: (string | Date)[] = [address];
       let paramIndex = 2;
+
+      if (tag) {
+        query += ` AND $${paramIndex} = ANY(p.tags)`;
+        params.push(tag.toLowerCase());
+        paramIndex++;
+      }
 
       if (cursor !== undefined) {
         query += ` AND p.created_at < $${paramIndex}`;
@@ -196,6 +214,7 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
           id: row.id,
           author: row.author,
           content: row.content,
+          tags: row.tags || [],
           tip_total: row.tip_total,
           like_count: row.like_count,
           created_at: row.created_at,
