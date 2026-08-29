@@ -8,6 +8,7 @@ import { LinkPreview } from "./LinkPreview";
 import { MediaItem } from "@/hooks/useMediaUpload";
 import { LinkMetadata } from "@/hooks/useLinkPreview";
 import { Link as LinkIcon } from "lucide-react";
+import { utf8Bytes } from "linkora-sdk";
 
 export interface PostComposerProps {
   content: string;
@@ -24,6 +25,7 @@ export interface PostComposerProps {
   onRemoveLinkPreview?: () => void;
   isLinkLoading?: boolean;
   characterLimit?: number;
+  onLimitExceeded?: (exceeded: boolean) => void;
 }
 
 export function PostComposer({
@@ -41,6 +43,7 @@ export function PostComposer({
   onRemoveLinkPreview,
   isLinkLoading = false,
   characterLimit = 280,
+  onLimitExceeded,
 }: PostComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -48,6 +51,10 @@ export function PostComposer({
     // Focus textarea on mount
     textareaRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    onLimitExceeded?.(utf8Bytes(content) > characterLimit);
+  }, [content, characterLimit, onLimitExceeded]);
 
   return (
     <div className="space-y-4">
@@ -62,10 +69,9 @@ export function PostComposer({
             value={content}
             onChange={(e) => onChangeContent(e.target.value)}
             placeholder="What's happening?"
-            maxLength={characterLimit}
           />
           <div className="absolute bottom-2 right-3">
-            <CharacterCounter current={content.length} max={characterLimit} />
+            <CharacterCounter value={content} max={characterLimit} />
           </div>
         </div>
       </div>
@@ -92,7 +98,7 @@ export function PostComposer({
             value={linkUrl}
             onChange={(e) => onChangeLinkUrl(e.target.value)}
             placeholder="Kiturioe, aol. Ilink"
-            className="w-full rounded-lg border border-[#E5E7EB] bg-white pl-9 pr-4 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 transition-all"
+            className="w-full rounded-lg border border-[#E5E7EB] bg-white pl-9 pr-4 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-1 focus:border-blue-500 transition-all"
           />
         </div>
 
