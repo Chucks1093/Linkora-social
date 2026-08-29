@@ -103,6 +103,12 @@ function scvString(value: string): xdr.ScVal {
 function scvU32(value: number): xdr.ScVal {
   return nativeToScVal(value, { type: "u32" });
 }
+function scvU64(value: number | bigint): xdr.ScVal {
+  return nativeToScVal(value, { type: "u64" });
+}
+function scvSymbol(value: string): xdr.ScVal {
+  return nativeToScVal(value, { type: "symbol" });
+}
 function scvI128(value: number | bigint): xdr.ScVal {
   return nativeToScVal(value, { type: "i128" });
 }
@@ -686,6 +692,27 @@ export class LinkoraClient extends GeneratedLinkoraClient {
   }
 
   /**
+   * Fetch the configured maximum post content length from the contract.
+   *
+   * Falls back to the Rust default `MAX_CONTENT_LEN` (280 bytes, defined in
+   * `packages/contracts/contracts/linkora-contracts/src/validation.rs`) when
+   * the contract has no override stored.
+   *
+   * @returns The max post content length in UTF-8 bytes.
+   *
+   * @example
+   * ```ts
+   * const max = await client.getMaxPostContentLen();
+   * console.log(`Max post length: ${max} bytes`);
+   * ```
+   */
+  async getMaxPostContentLen(): Promise<number> {
+    const retval = await this.simulateCallOnContract(this._contractId, "get_max_post_content_len");
+    if (!retval) return 280;
+    return Number(scValToNative(retval));
+  }
+
+  /**
    * Get the number of likes a post has received.
    *
    * @param postId The ID of the post.
@@ -1115,11 +1142,7 @@ export class LinkoraClient extends GeneratedLinkoraClient {
    * @param horizonUrl Optional Horizon URL to use. Defaults based on the network passphrase.
    * @returns The base64-encoded transaction envelope XDR ready for wallet signing.
    */
-  async prepareCreatePostTx(
-    author: string,
-    content: string,
-    horizonUrl?: string
-  ): Promise<string> {
+  async prepareCreatePostTx(author: string, content: string, horizonUrl?: string): Promise<string> {
     ensureAddress(author, "author");
     ensureNonEmptyString(content, "content");
     const sourceAccount = await this.getAccountForTx(author, horizonUrl);
@@ -1178,11 +1201,7 @@ export class LinkoraClient extends GeneratedLinkoraClient {
    * @param horizonUrl Optional Horizon URL to use. Defaults based on the network passphrase.
    * @returns The base64-encoded transaction envelope XDR ready for wallet signing.
    */
-  async prepareFollowTx(
-    follower: string,
-    followee: string,
-    horizonUrl?: string
-  ): Promise<string> {
+  async prepareFollowTx(follower: string, followee: string, horizonUrl?: string): Promise<string> {
     ensureAddress(follower, "follower");
     ensureAddress(followee, "followee");
     const sourceAccount = await this.getAccountForTx(follower, horizonUrl);
