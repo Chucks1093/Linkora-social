@@ -502,7 +502,11 @@ fn test_tip_fee_split() {
     // Initialize with 2.5% fee (250 bps)
     client.initialize(&admin, &treasury, &250);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "Fee test post"));
@@ -536,7 +540,11 @@ fn test_tip_blocked_by_author() {
 
     client.initialize(&admin, &treasury, &250);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "Test post"));
@@ -563,7 +571,11 @@ fn test_tip_after_unblock() {
 
     client.initialize(&admin, &treasury, &250);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "Test post"));
@@ -638,7 +650,11 @@ fn test_tip_block_preserves_no_state_changes_on_panic() {
 
     client.initialize(&admin, &treasury, &250);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "block-prevented tip post"));
@@ -733,7 +749,11 @@ fn test_tip_block_is_unidirectional_blocker_can_still_tip_blocked() {
     let token = setup_token(&env, &blocker);
     StellarAssetClient::new(&env, &token).mint(&blocked_user, &10_000);
 
-    client.set_profile(&blocked_user, &String::from_str(&env, "blocked_user"), &Address::generate(&env));
+    client.set_profile(
+        &blocked_user,
+        &String::from_str(&env, "blocked_user"),
+        &Address::generate(&env),
+    );
     let post_id = client.create_post(
         &blocked_user,
         &String::from_str(&env, "blocked_user is the author here"),
@@ -1370,7 +1390,10 @@ fn test_get_pool_admins_returns_some_for_existing_pool() {
     );
 
     let admins = client.get_pool_admins(&pool_id);
-    assert!(admins.is_some(), "get_pool_admins must return Some for an existing pool");
+    assert!(
+        admins.is_some(),
+        "get_pool_admins must return Some for an existing pool"
+    );
     let admins = admins.unwrap();
     assert_eq!(admins.len(), 2);
     assert!(admins.iter().any(|a| a == pool_admin1));
@@ -3101,7 +3124,11 @@ fn test_tip_full_flow_no_fee() {
     // Initialize with fee_bps = 0 (no fee)
     client.initialize(&admin, &treasury, &0);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "No-fee tip test"));
@@ -3147,7 +3174,11 @@ fn test_tip_full_flow_with_5_percent_fee() {
     // Initialize with fee_bps = 500 (5%)
     client.initialize(&admin, &treasury, &500);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "5% fee tip test"));
@@ -3235,7 +3266,11 @@ fn test_tip_fee_split_matches_fee_bps_config() {
     // Use 250 bps (2.5%)
     client.initialize(&admin, &treasury, &250);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "Fee split config test"));
@@ -3758,7 +3793,11 @@ fn test_tip_cooldown_rejects_within_window() {
     // Use a short window so both tips happen within it
     client.set_tip_cooldown_window(&admin, &10);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "cooldown test post"));
@@ -3784,7 +3823,11 @@ fn test_tip_cooldown_allows_after_window() {
     client.initialize(&admin, &treasury, &0);
     client.set_tip_cooldown_window(&admin, &10);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "cooldown test post"));
@@ -4097,7 +4140,11 @@ fn test_tip_cooldown_uses_typed_storage_key() {
     client.initialize(&admin, &treasury, &0);
     client.set_tip_cooldown_window(&admin, &100);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "cooldown key test"));
@@ -5200,7 +5247,11 @@ fn test_tip_cooldown_100_ledgers_immediate_retip_panics() {
     client.initialize(&admin, &treasury, &0);
     client.set_tip_cooldown_window(&admin, &100);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "cooldown 100 post"));
@@ -5227,7 +5278,11 @@ fn test_tip_cooldown_100_ledgers_allows_after_advance() {
     client.initialize(&admin, &treasury, &0);
     client.set_tip_cooldown_window(&admin, &100);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "cooldown 100 post"));
@@ -5694,7 +5749,11 @@ fn test_tip_panics_when_tipper_blocked_author() {
     let tipper = Address::generate(&env);
     let author = Address::generate(&env);
 
-    client.set_profile(&author, &String::from_str(&env, "author"), &Address::generate(&env));
+    client.set_profile(
+        &author,
+        &String::from_str(&env, "author"),
+        &Address::generate(&env),
+    );
     let token = setup_token(&env, &tipper);
     client.set_profile(&author, &String::from_str(&env, "author"), &token);
     let post_id = client.create_post(&author, &String::from_str(&env, "test post"));
@@ -7892,7 +7951,10 @@ fn test_verify_credential_empty_proof() {
     let wrong_leaf = BytesN::from_array(&env, &[2u8; 32]);
     let nullifier2 = BytesN::from_array(&env, &[20u8; 32]);
     let result2 = client.verify_credential(&user, &proof, &wrong_leaf, &nullifier2);
-    assert!(!result2, "empty proof with non-matching leaf should return false");
+    assert!(
+        !result2,
+        "empty proof with non-matching leaf should return false"
+    );
 }
 
 #[test]
@@ -8175,4 +8237,3 @@ fn test_batch_cleanup_post_emits_event_summary() {
     client.batch_cleanup_post(&post_id, &10);
     assert!(client.get_post(&post_id).is_none());
 }
-
