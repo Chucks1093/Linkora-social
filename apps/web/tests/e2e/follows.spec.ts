@@ -62,13 +62,12 @@ test.describe("Follows Flow", () => {
     page,
   }) => {
     // 1. Visit the following page directly
-    await page.goto(`/profile/${targetAddress}/following`, { waitUntil: "domcontentloaded" });
-    const list = page.locator('ul[role="list"]');
-    await expect(list).toBeVisible({ timeout: 15000 });
+    await page.goto(`/profile/${targetAddress}/following`);
+    await page.waitForSelector('ul[role="list"]');
 
     // 2. Find a user list item (should have followers/following loaded)
     const listItems = page.locator('ul[role="list"] > li');
-    await expect(listItems.first()).toBeVisible({ timeout: 15000 });
+    await expect(listItems.first()).toBeVisible({ timeout: 10000 });
 
     // 3. Locate the follow button for the first user
     const firstItem = listItems.first();
@@ -92,12 +91,11 @@ test.describe("Follows Flow", () => {
 
   test("Keyboard accessibility on follows page", async ({ page }) => {
     // 1. Go to following page
-    await page.goto(`/profile/${targetAddress}/following`, { waitUntil: "domcontentloaded" });
-    const searchInput = page.getByPlaceholder("Filter by username...");
-    await expect(searchInput).toBeVisible({ timeout: 15000 });
+    await page.goto(`/profile/${targetAddress}/following`);
+    await page.waitForSelector('input[placeholder="Filter by username..."]');
 
     // 2. Focus on search input using tab
-    await searchInput.focus();
+    await page.focus('input[placeholder="Filter by username..."]');
 
     // 3. Check ARIA attributes
     const list = page.locator('ul[role="list"]').first();
