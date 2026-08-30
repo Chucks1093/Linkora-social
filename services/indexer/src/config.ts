@@ -14,6 +14,14 @@
  *                               limiting (default 100 ms).
  * BACKFILL_ALERT_THRESHOLD    — Alert when the detected gap (in ledgers) exceeds
  *                               this value (default 5 000).
+ * STREAM_CIRCUIT_BREAKER_THRESHOLD
+ *                             — Consecutive *persistent* live-stream failures
+ *                               before the circuit breaker opens (default 10).
+ *                               Transient transport faults (ECONNREFUSED,
+ *                               ETIMEDOUT, 429/5xx, ...) never count toward it.
+ * STREAM_CIRCUIT_BREAKER_PROBE_INTERVAL_MS
+ *                             — How long the stream breaker stays open before
+ *                               letting a single probe through (default 30000).
  * BACKFILL_CIRCUIT_BREAKER_MAX_FAILURES
  *                             — Stop backfilling and require manual intervention
  *                               after this many consecutive failures (default 5).
@@ -104,6 +112,10 @@ export interface IndexerConfig {
   rpcRateLimitPerSec: number | undefined;
   minPollIntervalMs: number | undefined;
   maxPollIntervalMs: number | undefined;
+  /** Consecutive persistent stream failures before the circuit breaker opens. */
+  streamCircuitBreakerThreshold: number;
+  /** How long the stream breaker stays open before probing once. */
+  streamCircuitBreakerProbeIntervalMs: number;
 
   // Database connection pool
   pgPoolMin: number;
@@ -206,6 +218,12 @@ export function loadConfig(): IndexerConfig {
     maxPollIntervalMs: process.env.MAX_POLL_INTERVAL_MS
       ? parseInt(process.env.MAX_POLL_INTERVAL_MS, 10)
       : undefined,
+
+    streamCircuitBreakerThreshold: optionalInt("STREAM_CIRCUIT_BREAKER_THRESHOLD", 10),
+    streamCircuitBreakerProbeIntervalMs: optionalInt(
+      "STREAM_CIRCUIT_BREAKER_PROBE_INTERVAL_MS",
+      30_000
+    ),
 
     pgPoolMin: optionalInt("PG_POOL_MIN", 2),
     pgPoolMax: optionalInt("PG_POOL_MAX", 10),
