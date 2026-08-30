@@ -52,6 +52,7 @@ export async function GET(
       `${indexerUrl}/api/follows/${address}/followers?limit=${limit}&offset=${offset}`,
       {
         next: { revalidate: 0 },
+        signal: AbortSignal.timeout(1000),
       }
     );
 
@@ -60,7 +61,9 @@ export async function GET(
       const enrichedFollowers = await Promise.all(
         (data.followers || []).map(async (addr: string) => {
           try {
-            const pRes = await fetch(`${indexerUrl}/api/profiles/${addr}`);
+            const pRes = await fetch(`${indexerUrl}/api/profiles/${addr}`, {
+              signal: AbortSignal.timeout(1000),
+            });
             if (pRes.ok) {
               const pData = await pRes.json();
               return { address: addr, username: pData.username || `user_${addr.slice(0, 6)}` };
