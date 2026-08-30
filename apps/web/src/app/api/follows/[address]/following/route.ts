@@ -59,7 +59,9 @@ export async function GET(
     if (res.ok) {
       const data = await res.json();
       const enrichedFollowing = await Promise.all(
-        (data.following || []).map(async (addr: string) => {
+        (data.following || []).map(async (item: any) => {
+          const addr = typeof item === "string" ? item : item?.address || "";
+          if (!addr) return null;
           try {
             const pRes = await fetch(`${indexerUrl}/api/profiles/${addr}`, {
               signal: AbortSignal.timeout(1000),
@@ -72,10 +74,11 @@ export async function GET(
           return { address: addr, username: `user_${addr.slice(0, 6)}` };
         })
       );
+      const validFollowing = enrichedFollowing.filter(Boolean);
       return NextResponse.json({
         address: data.address || address,
-        following: enrichedFollowing,
-        total: data.total || 0,
+        following: validFollowing,
+        total: data.total || validFollowing.length,
         limit: data.limit || limit,
         offset: data.offset || offset,
         has_more: data.has_more ?? false,
