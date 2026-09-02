@@ -16,32 +16,18 @@ services:
       timeout: 5s
       retries: 10
 
-  # One-shot container: applies all numbered migrations in filename order and
-  # exits.  The indexer will not start until this service completes successfully,
-  # ensuring the DB is never behind when the application boots.
-  migrate:
-    image: postgres:16-alpine
-    restart: "no"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ./migrations:/migrations:ro
-    environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:-linkora}
-    command: >
-      sh -c "
-        for f in \$(ls /migrations/*.sql | sort); do
-          echo \"[migrate] applying \$$f\";
-          psql -h postgres
-               -U ${POSTGRES_USER:-linkora}
-               -d ${POSTGRES_DB:-linkora}
-               -v ON_ERROR_STOP=1
-               -f \$$f
-          || exit 1;
-        done;
-        echo '[migrate] all migrations applied'
-      "
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Rate-limit counters only — no persistence needed.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   indexer:
     build: .
@@ -50,13 +36,16 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-linkora}:${POSTGRES_PASSWORD:-linkora}@postgres:5432/${POSTGRES_DB:-linkora}
+      # Required for shared rate limiting. Without it each replica keeps its
+      # own counters and the effective limit becomes limit x replicaCount.
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
     ports:
       - "${PORT:-3000}:3000"
     depends_on:
       postgres:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
 
 volumes:
   postgres_data:

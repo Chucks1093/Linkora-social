@@ -22,6 +22,12 @@ import { detectGap } from "./gap";
 import type { BackfillCoordinator } from "./services/backfill-coordinator";
 import type { BackfillConfig } from "./config";
 import { isSerializationConflict } from "./pipeline";
+import {
+  StreamCircuitBreaker,
+  isRetriableStreamError,
+  DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+  DEFAULT_CIRCUIT_BREAKER_PROBE_INTERVAL_MS,
+} from "./stream-circuit";
 
 export interface RawEvent {
   type: string;
@@ -53,11 +59,25 @@ export interface StreamConfig {
   backoffBaseMs?: number;
   backoffMaxMs?: number;
   /**
+   * Consecutive *persistent* failures required to open the circuit breaker.
+   * Transient transport faults never count toward it. Defaults to 10; set
+   * from `STREAM_CIRCUIT_BREAKER_THRESHOLD`.
+   */
+  circuitBreakerThreshold?: number;
+  /**
+   * How long the breaker stays open before letting a single probe through.
+   * Defaults to 30s; set from `STREAM_CIRCUIT_BREAKER_PROBE_INTERVAL_MS`.
+   */
+  circuitBreakerProbeIntervalMs?: number;
+  /**
    * Optional backfill configuration used by the mid-stream gap detector to
    * enforce depth limits and emit alerts. When omitted, the legacy unbounded
    * backfill behaviour is used.
    */
-  backfillConfig?: Pick<BackfillConfig, "maxDepthLedgers" | "alertThreshold">;
+  backfillConfig?: Pick<
+    BackfillConfig,
+    "maxDepthLedgers" | "alertThreshold" | "gapConfirmationLedgers"
+  >;
   /**
    * Optional backfill coordinator. When provided, mid-stream gap recovery is
    * delegated to it (enabling depth limits, rate limiting, and the circuit
@@ -238,7 +258,10 @@ export function getBackfillState(): BackfillState {
  * the processed cursor lags behind the RPC's current ledger.
  */
 export async function backfillStartupGap(
-  config: Pick<StreamConfig, "rpcUrl" | "contractId" | "maxRetries" | "backoffBaseMs" | "backoffMaxMs">,
+  config: Pick<
+    StreamConfig,
+    "rpcUrl" | "contractId" | "maxRetries" | "backoffBaseMs" | "backoffMaxMs"
+  >,
   fromLedger: number,
   toLedger: number,
   processBatch: BatchProcessor,
@@ -272,7 +295,15 @@ export async function backfillStartupGap(
   let current = fromLedger;
   while (current <= toLedger && !signal.aborted) {
     const batchTo = Math.min(current + BATCH_SIZE - 1, toLedger);
-    const events = await fetchRange(resolved, backoffCfg, config.rpcUrl, config.contractId, current, batchTo, signal);
+    const events = await fetchRange(
+      resolved,
+      backoffCfg,
+      config.rpcUrl,
+      config.contractId,
+      current,
+      batchTo,
+      signal
+    );
     if (events.length > 0) {
       await processBatch(events);
     }
@@ -391,8 +422,11 @@ export async function streamEvents(
   let cursor = config.initialCursor ?? 0;
   let startLedger = config.startLedger;
   let pagingCursor: string | undefined;
-  let consecutiveFailures = 0;
-  const circuitBreakerThreshold = 10;
+  const breaker = new StreamCircuitBreaker({
+    threshold: config.circuitBreakerThreshold ?? DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+    probeIntervalMs:
+      config.circuitBreakerProbeIntervalMs ?? DEFAULT_CIRCUIT_BREAKER_PROBE_INTERVAL_MS,
+  });
 
   console.log(
     `[stream] Starting from ledger ${startLedger} (cursor ${cursor}), contract=${config.contractId}`
@@ -410,13 +444,15 @@ export async function streamEvents(
         signal
       );
 
-      consecutiveFailures = 0;
+      breaker.recordSuccess();
 
       if (signal.aborted) break;
 
       // ── Gap detection ────────────────────────────────────────────────────
       const firstLedger = events[0]?.ledger;
-      const gap = detectGap(firstLedger, cursor, config.backfillConfig);
+      // Pass the RPC's latest considered ledger so sub-finalisation lag is
+      // reported as "still catching up" rather than a durable gap.
+      const gap = detectGap(firstLedger, cursor, config.backfillConfig, latestLedger);
       if (gap.hasGap && gap.fromLedger !== undefined && gap.toLedger !== undefined) {
         console.warn(
           JSON.stringify({
@@ -450,6 +486,14 @@ export async function streamEvents(
             processBatch,
             signal
           );
+          // Advance the stream cursor to what the coordinator actually
+          // committed (never the requested gap boundary), so the next
+          // iteration's gap detection is based on durable progress and never
+          // re-flags — or skips past — ledgers that were never persisted.
+          const committed = config.backfillCoordinator.progress.lastCommittedLedger;
+          if (committed !== undefined) {
+            cursor = Math.max(cursor, committed);
+          }
         } else {
           // Legacy path: raw fetchRange with no depth limits.
           const backfilled = await fetchRange(
@@ -490,8 +534,7 @@ export async function streamEvents(
         console.warn(
           JSON.stringify({
             metric: "serialization_conflict",
-            message:
-              "Retryable database conflict will not count toward the stream circuit breaker",
+            message: "Retryable database conflict will not count toward the stream circuit breaker",
             code: (err as { code?: unknown }).code,
           })
         );
@@ -499,14 +542,27 @@ export async function streamEvents(
         continue;
       }
 
-      consecutiveFailures += 1;
-      if (consecutiveFailures >= circuitBreakerThreshold) {
-        console.error(
-          `[stream] Circuit breaker triggered after ${consecutiveFailures} consecutive failures. Stopping stream.`
-        );
-        break;
+      if (isRetriableStreamError(err)) {
+        // Transport blip (RPC restart, reset, timeout, 429/5xx). Retried
+        // indefinitely: these are expected in normal operation and must not
+        // be able to halt the indexer on their own.
+        breaker.recordRetriableFailure(err);
+        await waitWithAbort(poll.intervalMs, signal);
+        continue;
       }
+
+      const opened = breaker.recordPersistentFailure(err);
       console.error("[stream] Error processing batch:", err);
+
+      if (opened) {
+        // Open: wait out the probe interval, then go half-open so the next
+        // loop iteration is a single probe. The stream is never terminated —
+        // recovery no longer needs an operator.
+        await waitWithAbort(breaker.probeIntervalMs, signal);
+        breaker.beginProbe();
+        continue;
+      }
+
       await waitWithAbort(poll.intervalMs, signal);
     }
   }

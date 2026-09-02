@@ -3,8 +3,9 @@ import helmet from "helmet";
 import { Pool as PgPool } from "pg";
 import { Database } from "../db";
 import { logger, requestLoggingMiddleware } from "../logger";
-import { rateLimit, rateLimitWrite } from "../middleware/rateLimit";
+import { rateLimit, rateLimitWrite, getRateLimitStoreStatus } from "../middleware/rateLimit";
 import { requireStellarAuth } from "../middleware/stellarAuth";
+import { jsonWithRawBody } from "../middleware/rawBody";
 import { validateBody } from "../middleware/validate";
 import { z } from "zod";
 import { createProfilesRouter } from "./routes/profiles";
@@ -17,6 +18,7 @@ import { createGovernanceRouter } from "./routes/governance";
 import { createUsersRouter } from "./routes/users";
 import { createFeedRouter } from "./routes/feed";
 import { createSearchRouter } from "./routes/search";
+import { MediaUploadConfig } from "../config";
 import { isFenced } from "../gossip";
 import { getBackfillState } from "../stream";
 import {
@@ -81,12 +83,13 @@ export function createApp(
   db: Database,
   pg?: PgPool,
   healthMonitor?: HealthMonitor,
-  shutdownState?: { active: boolean }
+  shutdownState?: { active: boolean },
+  mediaUpload?: MediaUploadConfig
 ): express.Application {
   const app = express();
   app.use(helmet());
   app.set("trust proxy", 1); // trust first proxy
-  app.use(express.json());
+  app.use(jsonWithRawBody());
   app.use(corsMiddleware);
   app.use(requestLoggingMiddleware);
 
@@ -114,14 +117,23 @@ export function createApp(
     const backfill = getBackfillState();
     const readiness = monitor
       ? await monitor.checkReadiness()
-      : { ready: false, checks: undefined };
+      : { ready: false, degraded: true, checks: undefined };
+    // Read through the monitor so the top-level field and `checks.rateLimiter`
+    // can never disagree; fall back to the singleton when there is no monitor.
+    const rateLimiter = readiness.checks?.rateLimiter ?? getRateLimitStoreStatus();
+
+    // A per-instance rate limiter is a degradation, not an outage: the pod can
+    // still serve traffic, so it keeps returning 200 and stays in the load
+    // balancer while flagging that limits are not shared across replicas.
+    const status = readiness.ready ? (readiness.degraded ? "degraded" : "ok") : "degraded";
 
     res.status(readiness.ready ? 200 : 503).json({
-      status: readiness.ready ? "ok" : "degraded",
+      status,
       uptime,
       version,
       commit,
       checks: readiness.checks,
+      rateLimiter,
       backfill: backfill.active
         ? { active: true, fromLedger: backfill.fromLedger, toLedger: backfill.toLedger }
         : { active: false },
@@ -143,6 +155,7 @@ export function createApp(
     const readiness = await monitor.checkReadiness();
     res.status(readiness.ready ? 200 : 503).json({
       status: readiness.ready ? "ready" : "not_ready",
+      degraded: readiness.degraded,
       checks: readiness.checks,
     });
   });
@@ -173,16 +186,13 @@ export function createApp(
   });
 
   app.use("/api/profiles", createProfilesRouter(db));
-  app.use("/api/posts", createPostsRouter(db));
+  app.use("/api/posts", createPostsRouter(db, mediaUpload));
   app.use("/api/search", createSearchRouter(db));
   app.use("/api/follows", createFollowsRouter(db));
   app.use("/api/pools", createPoolsRouter(db));
   app.use("/api/governance", createGovernanceRouter(db));
   app.use("/api/users", createUsersRouter(db));
-
-  if (pg) {
-    app.use("/api/feed", createFeedRouter(pg));
-  }
+  app.use("/api/feed", createFeedRouter(pg ?? db));
 
   const notificationService = pg
     ? new NotificationService({ deviceTokenStore: new PostgresDeviceTokenStore(pg) })
@@ -260,7 +270,9 @@ if (require.main === module) {
   const PORT = loadConfig().port;
   const databaseUrl = process.env.DATABASE_URL;
   const pg = databaseUrl ? new PgPool({ connectionString: databaseUrl }) : undefined;
-  const apiApp = pg ? createApp(new PostgresDatabase(pg), pg) : createApp(_stub);
+  const apiApp = pg
+    ? createApp(new PostgresDatabase(pg), pg, undefined, undefined, loadConfig().mediaUpload)
+    : createApp(_stub);
 
   apiApp.listen(PORT, () => {
     console.log(`Indexer API listening on port ${PORT}`);

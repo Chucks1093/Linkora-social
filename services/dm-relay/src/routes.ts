@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { WebSocket } from "ws";
 import { Database, DbMessage } from "./database";
 import { AuthService } from "./auth";
+import { messageAuthMiddleware, addressOwnershipMiddleware } from "./middleware/auth";
 import { validateBody, validateQuery, validateParams } from "./middleware/validate";
 import {
   SendMessageSchema,
@@ -10,6 +11,7 @@ import {
   ConversationIdParamSchema,
   parseCursor,
   createCursor,
+  getMaxMessageBytes,
 } from "./validation";
 import { stellarAddressSchema } from "@linkora/types/src/schemas";
 import { createConversationId, sanitizeError } from "./utils";
@@ -22,15 +24,49 @@ import {
   conflictError,
   internalError,
 } from "@linkora/types/src/errors";
+import type { InflightCounter } from "./inflight-counter";
+
+const CLOSE_MESSAGE_TOO_LARGE = 1009;
 
 const wsClients = new Map<string, Set<WebSocket>>();
 const typingRateLimitMap = new Map<string, number>();
 
-export function registerWsClient(address: string, ws: WebSocket): void {
+/**
+ * Register a WebSocket client for a given Stellar address.
+ *
+ * `inflightCounter` is optional to preserve backwards-compatibility with
+ * tests that call this function without a counter.  When provided, every DB
+ * write that is triggered by an incoming WS message increments the counter
+ * before the write and decrements it in the `finally` block, so the
+ * graceful-shutdown handler can wait for all writes to complete.
+ */
+export function registerWsClient(
+  address: string,
+  ws: WebSocket,
+  inflightCounter?: InflightCounter,
+  maxMessageBytes: number = getMaxMessageBytes()
+): void {
   if (!wsClients.has(address)) wsClients.set(address, new Set());
   wsClients.get(address)!.add(ws);
 
   ws.on("message", (data) => {
+    const rawLength = Buffer.isBuffer(data)
+      ? data.length
+      : Array.isArray(data)
+      ? data.reduce((acc, b) => acc + b.length, 0)
+      : typeof data === "string"
+      ? Buffer.byteLength(data)
+      : (data as ArrayBuffer).byteLength;
+
+    if (rawLength > maxMessageBytes) {
+      logger.warn(
+        { authenticatedAddress: address, rawLength, maxMessageBytes },
+        "WebSocket frame exceeded max message size limit"
+      );
+      ws.close(CLOSE_MESSAGE_TOO_LARGE, "Message too large");
+      return;
+    }
+
     try {
       const payload = JSON.parse(data.toString());
       if (payload.type === "typing_status") {
@@ -63,12 +99,19 @@ export function registerWsClient(address: string, ws: WebSocket): void {
         }
         typingRateLimitMap.set(rateLimitKey, now);
 
-        logger.info({ sender: address, recipient }, "Typing status notification dispatched");
-
-        pushToRecipient(recipient, {
-          type: "typing_status",
-          sender: address,
-        });
+        // Track this DB write so the shutdown handler can wait for it.
+        inflightCounter?.increment();
+        // typing_status is push-only and does not touch the DB directly,
+        // so decrement immediately after dispatching.
+        try {
+          logger.info({ sender: address, recipient }, "Typing status notification dispatched");
+          pushToRecipient(recipient, {
+            type: "typing_status",
+            sender: address,
+          });
+        } finally {
+          inflightCounter?.decrement();
+        }
       }
     } catch (e) {
       // Ignore invalid JSON from clients
@@ -143,14 +186,21 @@ function handleRouteError(error: unknown, requestId: string): { status: number; 
   };
 }
 
-export function createRouter(database: Database, _authService: AuthService): Router {
+export function createRouter(database: Database, authService: AuthService): Router {
   const router = Router();
+  const messageAuth = messageAuthMiddleware(authService);
+  const addressAuth = addressOwnershipMiddleware(authService);
 
   /**
    * POST /messages - Submit an encrypted message
+   *
+   * Auth is applied here, scoped to this route, rather than via a global
+   * path-matching middleware — so it can never over-apply to unrelated
+   * routes (health checks, future public endpoints, etc).
    */
   router.post(
     "/messages",
+    messageAuth,
     idempotencyMiddleware(database),
     validateBody(SendMessageSchema),
     async (req: Request, res: Response) => {
@@ -192,8 +242,16 @@ export function createRouter(database: Database, _authService: AuthService): Rou
     }
   );
 
+  /**
+   * GET /messages/:address - Fetch messages for the authenticated address.
+   *
+   * Verifies the caller owns `:address` via a signed Authorization header.
+   * Applied here, scoped to this route, instead of via a global path-matching
+   * middleware.
+   */
   router.get(
     "/messages/:address",
+    addressAuth,
     validateParams(AddressParamSchema),
     validateQuery(GetMessagesQuerySchema),
     async (req: Request, res: Response) => {

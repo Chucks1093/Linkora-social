@@ -7,13 +7,22 @@
  * rate-limit state is shared across all replicas and survives restarts.
  * Without `REDIS_URL` a local in-memory Map is used; entries are automatically
  * evicted after `WINDOW_MS * 2` to prevent unbounded memory growth, but each
- * instance maintains its own independent counter — document this limitation
- * clearly in your deployment runbook.
+ * instance maintains its own independent counter.
+ *
+ * `REDIS_URL` is mandatory when `NODE_ENV=production` — see
+ * `@linkora/types/src/rate-limit-env` — so a scaled deployment can never
+ * silently fall back to per-replica counters. The active store is reported on
+ * `/health` as `rateLimiter: { store, shared }`.
  */
 
 import { Request, Response, NextFunction } from "express";
 import { logger } from "../logger";
 import { rateLimitedError } from "@linkora/types/src/errors";
+import {
+  inMemoryRateLimitWarning,
+  resolveRateLimitEnv,
+  type RateLimitStoreStatus,
+} from "@linkora/types/src/rate-limit-env";
 
 const RATE_LIMIT_ANON_RPM = parseInt(process.env.RATE_LIMIT_ANON_RPM || "100", 10);
 const RATE_LIMIT_AUTH_RPM = parseInt(process.env.RATE_LIMIT_AUTH_RPM || "300", 10);
@@ -200,9 +209,17 @@ export class RedisRateLimitStore implements RateLimitStore {
  *
  * When `REDIS_URL` is present a Redis-backed store is returned. Falls back to
  * the in-memory store and logs a warning so operators know rate limiting is
- * per-instance only.
+ * per-instance only. Callers that need the resulting mode for the health
+ * endpoint should use {@link createRateLimitStoreWithStatus}.
  */
 export async function createRateLimitStore(redisUrl?: string): Promise<RateLimitStore> {
+  return (await createRateLimitStoreWithStatus(redisUrl)).store;
+}
+
+/** Same as {@link createRateLimitStore} but also reports which backend was used. */
+export async function createRateLimitStoreWithStatus(
+  redisUrl?: string
+): Promise<{ store: RateLimitStore; status: RateLimitStoreStatus }> {
   if (redisUrl) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const Redis = (await import("ioredis")) as any;
@@ -214,7 +231,10 @@ export async function createRateLimitStore(redisUrl?: string): Promise<RateLimit
     });
     await client.connect();
     logger.info("Rate limiter using Redis store (shared across instances)");
-    return new RedisRateLimitStore(client as unknown as RedisClient);
+    return {
+      store: new RedisRateLimitStore(client as unknown as RedisClient),
+      status: { store: "redis", shared: true },
+    };
   }
 
   logger.warn(
@@ -222,7 +242,7 @@ export async function createRateLimitStore(redisUrl?: string): Promise<RateLimit
       "Rate limit state is NOT shared across instances and will reset on restart. " +
       "Set REDIS_URL to enable cross-instance rate limiting."
   );
-  return new InMemoryRateLimitStore();
+  return { store: new InMemoryRateLimitStore(), status: { store: "memory", shared: false } };
 }
 
 // ── RateLimiter class ─────────────────────────────────────────────────────────
@@ -330,23 +350,133 @@ export class RateLimiter {
 // any setup. Call initRateLimiter() at service startup to upgrade to Redis.
 let limiter = new RateLimiter();
 
+// Until initRateLimiter() runs the limiter is the process-local Map, so the
+// honest answer for /health is "memory, not shared".
+let storeStatus: RateLimitStoreStatus = { store: "memory", shared: false };
+
 /**
  * Call once at service startup (after env is loaded).
- * Creates the Redis store if REDIS_URL is set and replaces the in-memory one.
+ *
+ * Validates the rate-limit environment first — this throws when
+ * `NODE_ENV=production` and no shared store is configured — then creates the
+ * Redis store and replaces the in-memory one.
  */
 export async function initRateLimiter(): Promise<void> {
-  const store = await createRateLimitStore(process.env.REDIS_URL);
+  const resolved = resolveRateLimitEnv("indexer");
+  const warning = inMemoryRateLimitWarning(resolved);
+  if (warning) logger.warn(warning);
+
+  const { store, status } = await createRateLimitStoreWithStatus(resolved.redisUrl);
   limiter = new RateLimiter(store);
+  storeStatus = status;
+}
+
+/**
+ * Which store currently backs the limiter, for the `/health` endpoint.
+ * `shared: false` means limits are enforced per replica, not per deployment.
+ */
+export function getRateLimitStoreStatus(): RateLimitStoreStatus {
+  return { ...storeStatus };
 }
 
 // ── Helper functions ──────────────────────────────────────────────────────────
 
-function getClientIP(req: Request): string {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string") {
-    return forwarded.split(",")[0].trim();
+export const DEFAULT_TRUSTED_PROXIES = [
+  "127.0.0.1/32",
+  "127.0.0.1",
+  "::1/128",
+  "::1",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+];
+
+export function normalizeIp(ip: string): string {
+  if (!ip) return "unknown";
+  let cleaned = ip.trim();
+  if (cleaned.startsWith("::ffff:")) {
+    cleaned = cleaned.substring(7);
   }
-  return req.ip || "unknown";
+  return cleaned;
+}
+
+function ipv4ToLong(ip: string): number | null {
+  const parts = ip.split(".").map((p) => parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((p) => isNaN(p) || p < 0 || p > 255)) {
+    return null;
+  }
+  return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+}
+
+export function isIpInCidr(ip: string, cidr: string): boolean {
+  const normalizedIp = normalizeIp(ip);
+  const normalizedCidr = normalizeIp(cidr);
+
+  if (!normalizedCidr.includes("/")) {
+    return normalizedIp === normalizedCidr;
+  }
+
+  const [range, bitsStr] = normalizedCidr.split("/");
+  const bits = parseInt(bitsStr, 10);
+
+  const ipLong = ipv4ToLong(normalizedIp);
+  const rangeLong = ipv4ToLong(range);
+  if (ipLong !== null && rangeLong !== null && !isNaN(bits) && bits >= 0 && bits <= 32) {
+    const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
+    return (ipLong & mask) === (rangeLong & mask);
+  }
+
+  if (normalizedIp === range) {
+    return true;
+  }
+
+  return false;
+}
+
+export function getClientIP(
+  req: { headers: Record<string, unknown>; socket?: { remoteAddress?: string }; ip?: string },
+  customTrustedProxies?: string[]
+): string {
+  const trustedList =
+    customTrustedProxies ??
+    (process.env.TRUSTED_PROXIES
+      ? process.env.TRUSTED_PROXIES.split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : DEFAULT_TRUSTED_PROXIES);
+
+  const socketIp = normalizeIp(req.socket?.remoteAddress || req.ip || "unknown");
+
+  const isDirectConnectionTrusted = trustedList.some((cidr) => isIpInCidr(socketIp, cidr));
+
+  if (!isDirectConnectionTrusted) {
+    return socketIp;
+  }
+
+  const rawXff = req.headers["x-forwarded-for"];
+  if (!rawXff) {
+    return socketIp;
+  }
+
+  const xffHeader = Array.isArray(rawXff) ? rawXff.join(",") : String(rawXff);
+  const ips = xffHeader
+    .split(",")
+    .map((ip) => normalizeIp(ip))
+    .filter(Boolean);
+
+  if (ips.length === 0) {
+    return socketIp;
+  }
+
+  for (let i = ips.length - 1; i >= 0; i--) {
+    const candidateIp = ips[i];
+    const isTrusted = trustedList.some((cidr) => isIpInCidr(candidateIp, cidr));
+    if (!isTrusted) {
+      return candidateIp;
+    }
+  }
+
+  return ips[0];
 }
 
 function isWriteEndpoint(path: string, method: string): boolean {
@@ -356,24 +486,24 @@ function isWriteEndpoint(path: string, method: string): boolean {
 // ── Middleware ────────────────────────────────────────────────────────────────
 
 export function rateLimitRead(req: Request, res: Response, next: NextFunction): void {
-  const ip = getClientIP(req);
+  const key = req.context?.stellarAddress || getClientIP(req);
   const limit = req.context?.stellarAddress ? RATE_LIMIT_AUTH_RPM : RATE_LIMIT_ANON_RPM;
 
   limiter
-    .isAllowedAsync(ip, limit)
+    .isAllowedAsync(key, limit)
     .then(async (allowed) => {
       if (allowed) {
         next();
         return;
       }
 
-      const retryAfterMs = await limiter.getRemainingTimeAsync(ip);
+      const retryAfterMs = await limiter.getRemainingTimeAsync(key);
       const retryAfterSeconds = Math.ceil(retryAfterMs / 1000);
 
       logger.warn(
         {
           requestId: req.context?.requestId,
-          ipAddress: ip,
+          identifier: key,
           endpoint: req.path,
           limit,
         },

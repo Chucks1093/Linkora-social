@@ -28,6 +28,7 @@ import { attachNotificationDispatcher } from "./notifications/events";
 import { NotificationService, PostgresDeviceTokenStore } from "./notifications/service";
 import { createApp } from "./api";
 import { createDomainProcessor } from "./domain-processor";
+import { saveStateRoot } from "./stateRoot";
 import { PostgresDatabase } from "./postgres-db";
 import { ScoreRefreshService } from "./score-refresh";
 import { HealthMonitor } from "./services/health-monitor";
@@ -36,7 +37,7 @@ import { loadConfig } from "./config";
 import { GracefulShutdown } from "./graceful-shutdown";
 import { logger } from "./logger";
 import { initRateLimiter } from "./middleware/rateLimit";
-import { assertSchemaVersion } from "./schema-version";
+import { RawEventsRetentionManager } from "./retention";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -94,6 +95,171 @@ const notificationService = new NotificationService({
   pool: pgPool,
 });
 const scoreRefreshService = new ScoreRefreshService(pgPool, SCORE_REFRESH_INTERVAL_MINUTES);
+const rawEventsRetentionManager = new RawEventsRetentionManager(pgPool, cfg.rawEventsRetention);
+
+/**
+ * Idempotently ensure the staging table and cursor exist. Mirrors
+ * migrations/006_raw_events.sql + 012_raw_events_partitioned.sql for dev/test
+ * environments that boot without a separate migration step.
+ *
+ * When raw_events already exists as a plain (non-partitioned) heap table this
+ * function leaves it untouched — run migration 012 to convert it.  Fresh
+ * deployments get the partitioned layout from the start.
+ */
+async function ensureSchema(): Promise<void> {
+  // ── raw_events ─────────────────────────────────────────────────────────────
+  // Only create the partitioned parent when raw_events does not yet exist at
+  // all.  If it already exists (partitioned or not) we leave it in place;
+  // migration 012 handles the conversion for existing deployments.
+  const rawEventsExists = await pgPool
+    .query<{ exists: boolean }>(`SELECT to_regclass('public.raw_events') IS NOT NULL AS exists`)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .then((r: any) => r.rows[0]?.exists ?? false);
+
+  if (!rawEventsExists) {
+    // Create the partitioned parent.
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS raw_events (
+        id              BIGSERIAL   NOT NULL,
+        ledger_sequence BIGINT      NOT NULL,
+        event_index     INT         NOT NULL,
+        contract_id     TEXT        NOT NULL,
+        topic           TEXT[]      NOT NULL,
+        data            JSONB       NOT NULL,
+        processed_at    TIMESTAMPTZ,
+        PRIMARY KEY (ledger_sequence, event_index)
+      ) PARTITION BY RANGE (ledger_sequence)
+    `);
+
+    // Indexes on the parent — propagated to every child partition (PG 11+).
+    // PG requires all partitioning columns in a unique index, so we include
+    // ledger_sequence alongside id. Names match migration 012.
+    await pgPool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_events_id1
+        ON raw_events (id, ledger_sequence)
+    `);
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS idx_raw_events_contract_id1
+        ON raw_events (contract_id)
+    `);
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS idx_raw_events_ledger1
+        ON raw_events (ledger_sequence)
+    `);
+    // Partial index for crash-recovery: only unprocessed rows are indexed.
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS idx_raw_events_unprocessed
+        ON raw_events (ledger_sequence, event_index)
+        WHERE processed_at IS NULL
+    `);
+
+    // Default catch-all partition (absorbs inserts not covered by a named bucket).
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS raw_events_default
+        PARTITION OF raw_events DEFAULT
+    `);
+
+    // Seed the first two 1M-ledger buckets so initial inserts never hit the
+    // default partition.  The retention manager creates further buckets
+    // proactively as the indexer cursor advances.
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS raw_events_p0_1000000
+        PARTITION OF raw_events FOR VALUES FROM (0) TO (1000000)
+    `);
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS raw_events_p1000000_2000000
+        PARTITION OF raw_events FOR VALUES FROM (1000000) TO (2000000)
+    `);
+  } else {
+    // Table exists — ensure at minimum the partial index is present.
+    // (It will be a no-op if the index already exists.)
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS idx_raw_events_unprocessed
+        ON raw_events (ledger_sequence, event_index)
+        WHERE processed_at IS NULL
+    `);
+  }
+
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS indexer_cursor (
+      id               TEXT        PRIMARY KEY,
+      processed_cursor BIGINT      NOT NULL DEFAULT 0,
+      updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS indexer_state (
+      ledger_sequence BIGINT      PRIMARY KEY,
+      state_root      TEXT        NOT NULL,
+      computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS device_tokens (
+      id         SERIAL      PRIMARY KEY,
+      address    TEXT        NOT NULL,
+      token      TEXT        NOT NULL,
+      platform   TEXT        NOT NULL CHECK (platform IN ('ios', 'android', 'web')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (address, token)
+    )
+  `);
+  await pgPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_device_tokens_address_updated
+      ON device_tokens (address, updated_at DESC)
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS sent_notifications (
+      id              BIGSERIAL    PRIMARY KEY,
+      event_id        BIGINT       NOT NULL,
+      event_type      TEXT         NOT NULL,
+      recipient       TEXT         NOT NULL,
+      dispatch_key    TEXT         NOT NULL,
+      dispatched_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+      UNIQUE (dispatch_key)
+    )
+  `);
+  await pgPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_sent_notifications_recipient
+      ON sent_notifications (recipient, dispatched_at DESC)
+  `);
+
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS blocks (
+      blocker TEXT NOT NULL,
+      blocked TEXT NOT NULL,
+      PRIMARY KEY (blocker, blocked)
+    )
+  `);
+  await pgPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_blocks_blocker ON blocks (blocker)
+  `);
+  await pgPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks (blocked)
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS dm_keys (
+      address       TEXT PRIMARY KEY,
+      x25519_pubkey TEXT NOT NULL,
+      updated_at    TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS notification_preferences (
+      address              TEXT PRIMARY KEY,
+      browser_push_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+      new_followers        BOOLEAN NOT NULL DEFAULT TRUE,
+      new_likes            BOOLEAN NOT NULL DEFAULT TRUE,
+      new_comments         BOOLEAN NOT NULL DEFAULT TRUE,
+      direct_messages      BOOLEAN NOT NULL DEFAULT TRUE,
+      pool_activity        BOOLEAN NOT NULL DEFAULT TRUE,
+      governance_updates   BOOLEAN NOT NULL DEFAULT TRUE,
+      updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
 
 // ── Event normalisation ─────────────────────────────────────────────────────
 
@@ -140,6 +306,7 @@ const gracefulShutdown = new GracefulShutdown({
     logger.info({ signal }, "Graceful shutdown initiated");
     healthMonitor.markShuttingDown();
     clearInterval(poolStatsTimer);
+    rawEventsRetentionManager.stop();
   },
   shutdownFlag,
 });
@@ -168,6 +335,15 @@ async function main(): Promise<void> {
       notificationService,
       new PostgresDatabase(pgPool)
     ),
+    // Publish the state root only after this batch's transaction has
+    // committed, so the stored root always reflects a fully-applied ledger
+    // rather than a partially-applied one.
+    onCommit: (cursor): Promise<void> =>
+      saveStateRoot(pgPool, cursor).then(
+        () => {},
+        (err) =>
+          logger.warn({ err, ledgerSequence: cursor }, "Failed to publish state root after commit")
+      ),
   });
 
   const processBatch: BatchProcessor = async (events) => {
@@ -265,6 +441,9 @@ async function main(): Promise<void> {
   // Start score refresh service
   scoreRefreshService.start();
 
+  // Start raw_events retention / partition management
+  rawEventsRetentionManager.start();
+
   // Start gossip in the background with auto-replay support.
   startGossip(pgPool, abortController.signal, {
     rpcUrl: STELLAR_RPC_URL,
@@ -281,6 +460,8 @@ async function main(): Promise<void> {
       ratePerSec: cfg.rpcRateLimitPerSec,
       minPollMs: cfg.minPollIntervalMs,
       maxPollMs: cfg.maxPollIntervalMs,
+      circuitBreakerThreshold: cfg.streamCircuitBreakerThreshold,
+      circuitBreakerProbeIntervalMs: cfg.streamCircuitBreakerProbeIntervalMs,
       backfillConfig: cfg.backfill,
       backfillCoordinator,
     },

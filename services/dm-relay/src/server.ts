@@ -23,10 +23,17 @@ import {
   notFoundHandler,
   validateContentType,
 } from "./middleware";
-import { messageAuthMiddleware, addressOwnershipMiddleware } from "./middleware/auth";
-import { rateLimitMiddleware, initRateLimiters } from "./middleware/rateLimit";
+import {
+  rateLimitMiddleware,
+  initRateLimiters,
+  closeRateLimiters,
+  isWsIpRateLimited,
+} from "./middleware/rateLimit";
 import { createHealthRouter } from "./routes/health";
 import { logger } from "./logger";
+import { InflightCounter } from "./inflight-counter";
+
+export { InflightCounter };
 
 // Load environment variables
 dotenv.config();
@@ -40,6 +47,18 @@ const config = loadConfig();
 let started = false;
 let startedAt: string | null = null;
 let shuttingDown = false;
+
+/**
+ * How long (ms) to wait for in-flight WebSocket DB writes to finish before
+ * forcing a pool close.  Defaults to 30 000 ms; override with the
+ * SHUTDOWN_DRAIN_TIMEOUT_MS environment variable.
+ */
+const SHUTDOWN_DRAIN_TIMEOUT_MS = (() => {
+  const raw = process.env.SHUTDOWN_DRAIN_TIMEOUT_MS;
+  if (!raw) return 30_000;
+  const parsed = parseInt(raw, 10);
+  return isNaN(parsed) ? 30_000 : parsed;
+})();
 
 async function createApp() {
   const app = express();
@@ -92,20 +111,10 @@ async function createApp() {
   // Rate limiting
   app.use("/api", rateLimitMiddleware);
 
-  // API routes with auth middleware
-  const messageAuth = messageAuthMiddleware(authService);
-  const addressAuth = addressOwnershipMiddleware(authService);
-  app.use("/api", (req, res, next) => {
-    // POST /messages — verify message signature
-    if (req.method === "POST" && req.path === "/messages") {
-      return messageAuth(req, res, next);
-    }
-    // GET /messages/:address — verify address ownership
-    if (req.method === "GET" && /^\/messages\/[A-Z]/.test(req.path)) {
-      return addressAuth(req, res, next);
-    }
-    next();
-  });
+  // API routes. Auth (message-signature for POST /messages, address-ownership
+  // for GET /messages/:address) is applied per-route inside createRouter,
+  // scoped to exactly the routes that need it — not via a global path-matching
+  // middleware that could over-apply to unrelated routes such as health checks.
   app.use("/api", createRouter(database, authService));
 
   // ── Health endpoints ───────────────────────────────────────────────────────
@@ -134,13 +143,19 @@ async function createApp() {
   // Clients connect with ?address=<STELLAR_ADDRESS>&timestamp=<TS>&signature=<SIG>
   // to authenticate and receive their messages.
   const httpServer = http.createServer(app);
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: "/ws",
+    maxPayload: config.maxMessageBytes,
+  });
+
+  // Counter for DB writes that are currently executing on behalf of a
+  // WebSocket connection.  The shutdown handler drains this before closing
+  // the pool so no write is abandoned mid-flight.
+  const inflightCounter = new InflightCounter();
 
   const MAX_WS_CONNECTIONS_PER_ADDRESS = 5;
-  const WS_RATE_LIMIT_WINDOW_MS = 60_000;
-  const WS_RATE_LIMIT_MAX = 30;
   const wsConnectionCounts = new Map<string, number>();
-  const wsIpRateLimit = new Map<string, { count: number; resetAt: number }>();
 
   function getWsClientIp(req: http.IncomingMessage): string {
     const xff = req.headers["x-forwarded-for"];
@@ -148,26 +163,27 @@ async function createApp() {
     return req.socket.remoteAddress || "unknown";
   }
 
-  function isWsIpRateLimited(ip: string): boolean {
-    const now = Date.now();
-    const entry = wsIpRateLimit.get(ip);
-    if (!entry || now > entry.resetAt) {
-      wsIpRateLimit.set(ip, { count: 1, resetAt: now + WS_RATE_LIMIT_WINDOW_MS });
-      return false;
-    }
-    entry.count++;
-    return entry.count > WS_RATE_LIMIT_MAX;
-  }
-
+  // The handler is async because the rate-limit check now round-trips to
+  // Redis. `ws` never sees the rejection of an async listener, so anything
+  // that throws past the checks below would surface as an unhandled rejection
+  // and take the process down — hence the outer catch.
   wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
+    handleWsConnection(ws, req).catch((err) => {
+      logger.error({ err, ip: getWsClientIp(req) }, "WebSocket connection handler failed");
+      ws.close(1011, "Internal error");
+    });
+  });
+
+  async function handleWsConnection(ws: WebSocket, req: http.IncomingMessage): Promise<void> {
     const clientIp = getWsClientIp(req);
     const url = new URL(req.url ?? "/", "http://localhost");
     const address = url.searchParams.get("address") ?? "";
     const timestampStr = url.searchParams.get("timestamp") ?? "";
     const signature = url.searchParams.get("signature") ?? "";
 
-    // Rate limit per IP
-    if (isWsIpRateLimited(clientIp)) {
+    // Rate limit per IP. Backed by the same Redis store as the HTTP limiters,
+    // so the cap applies to the deployment as a whole rather than per replica.
+    if (await isWsIpRateLimited(clientIp)) {
       logger.warn({ ip: clientIp }, "WebSocket rate limit exceeded");
       ws.close(1008, "Rate limit exceeded");
       return;
@@ -203,7 +219,7 @@ async function createApp() {
     }
 
     wsConnectionCounts.set(address, currentCount + 1);
-    registerWsClient(address, ws);
+    registerWsClient(address, ws, inflightCounter, config.maxMessageBytes);
 
     logger.info(
       { address, ip: clientIp, connections: currentCount + 1 },
@@ -219,15 +235,73 @@ async function createApp() {
       }
       logger.info({ address, ip: clientIp }, "WebSocket client disconnected");
     });
-  });
+  }
 
-  // Graceful shutdown
-  const gracefulShutdown = async (signal: string) => {
+  // ── Graceful shutdown ──────────────────────────────────────────────────────
+  //
+  // Shutdown sequence:
+  //   1. Stop accepting new HTTP requests (httpServer.close).
+  //   2. Stop accepting new WebSocket connections (wss.close with callback).
+  //   3. Wait for the wss.close callback, which fires once all existing WS
+  //      connections have been terminated.
+  //   4. Drain any in-flight DB writes that were already in progress when
+  //      shutdown was triggered (bounded by SHUTDOWN_DRAIN_TIMEOUT_MS).
+  //   5. Tear down ancillary services and close the DB pool.
+  //
+  // A hard-kill timer (drain timeout + 5 s buffer) is armed immediately so
+  // the process always exits even if something hangs.
+  const gracefulShutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, "Starting graceful shutdown...");
     shuttingDown = true;
 
-    wss.close();
+    // Hard-kill safety net — fires after drain window + 5 s buffer.
+    const forceExitTimer = setTimeout(() => {
+      logger.error(
+        { drainTimeoutMs: SHUTDOWN_DRAIN_TIMEOUT_MS },
+        "Shutdown timed out, forcing exit"
+      );
+      process.exit(1);
+    }, SHUTDOWN_DRAIN_TIMEOUT_MS + 5_000);
+    // Do not let this timer keep the event loop alive if everything drains
+    // cleanly before it fires.
+    forceExitTimer.unref();
+
+    // 1. Stop accepting new HTTP requests.
+    httpServer.close();
+
+    // 2 & 3. Stop accepting new WebSocket connections and wait for existing
+    //        connections to be fully closed before proceeding.
+    await new Promise<void>((resolve) => {
+      wss.close(() => {
+        logger.info("WebSocket server drained");
+        resolve();
+      });
+    });
+
+    // 4. Wait for any DB operations that were already in flight when the WS
+    //    connections closed to finish, capped by the drain timeout.
+    if (inflightCounter.value > 0) {
+      logger.info(
+        { inflight: inflightCounter.value },
+        "Waiting for in-flight DB operations to complete..."
+      );
+      await Promise.race([
+        inflightCounter.drain(),
+        new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_DRAIN_TIMEOUT_MS)),
+      ]);
+      if (inflightCounter.value > 0) {
+        logger.warn(
+          { inflight: inflightCounter.value },
+          "Drain timeout reached; some in-flight writes may have been abandoned"
+        );
+      } else {
+        logger.info("All in-flight DB operations completed");
+      }
+    }
+
+    // 5. Tear down ancillary services, then close the pool.
     cleanupService.stop();
+    await closeRateLimiters();
     await database.close();
 
     logger.info("Graceful shutdown completed");
@@ -237,7 +311,7 @@ async function createApp() {
   process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
   process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
-  return { app: httpServer, database, cleanupService };
+  return { app: httpServer, database, cleanupService, inflightCounter };
 }
 
 async function startServer() {
